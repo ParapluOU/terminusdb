@@ -24,7 +24,7 @@ jobs:
       - name: Extract version from source
         id: version
         run: |
-          VERSION=$(grep "^terminusdb_version(" src/config/terminus_config.pl | grep -oP "'\K[^']+")
+          VERSION=$(sed -n "s/^terminusdb_version('\([^']*\)').*/\1/p" src/config/terminus_config.pl)
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Extracted version: $VERSION"
 
