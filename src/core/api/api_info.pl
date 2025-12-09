@@ -15,7 +15,11 @@ info(_System_DB, Auth, Info) :-
     terminusdb_version(TerminusDB_Version),
     terminus_store_version(TerminusDB_Store_Version),
     current_prolog_flag(terminusdb_git_hash, Git_Hash),
-    get_db_version(Storage_Version),
+    % In memory mode, there is no storage version file, so fall back to database_version
+    (   catch(get_db_version(Storage_Version), _, fail)
+    ->  true
+    ;   database_version(Storage_Version)
+    ),
     number_string(Storage_Version, Storage_Version_String),
 
     Info = _{
