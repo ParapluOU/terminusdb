@@ -1521,8 +1521,10 @@ assert_system_db_is_accessible :-
 run(Argv) :-
     % Check env vars to report errors as soon as possible.
     check_all_env_vars,
+    % Skip system db check for commands that either don't need it or will set up their own store.
+    % 'serve' is included because --memory mode initializes an in-memory store in terminus_server/2.
     (   Argv = [Cmd|_],
-        member(Cmd, ['--version', help, store, test])
+        member(Cmd, ['--version', help, store, test, serve])
     ;   assert_system_db_is_accessible),
     run_(Argv).
 
