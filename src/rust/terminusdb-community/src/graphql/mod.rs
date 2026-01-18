@@ -321,11 +321,11 @@ fn serialize_graphql_response(response: &GraphQLResponse) -> Result<String, serd
     Ok(post_process_graphql_numbers(json))
 }
 
-mod filter;
+pub mod filter;
 pub mod frame;
 mod main_graph;
 pub(crate) mod mutation;
-mod naming;
+pub mod naming;
 pub mod query;
 mod sanitize;
 pub mod schema;

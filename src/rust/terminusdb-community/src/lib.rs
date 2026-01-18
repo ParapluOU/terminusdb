@@ -11,7 +11,7 @@ pub mod consts;
 mod doc;
 mod embedding;
 mod expanded_name;
-mod graphql;
+pub mod graphql;
 mod inference;
 mod json_preserve;
 mod jwt;
@@ -20,7 +20,7 @@ mod prefix;
 mod schema;
 mod template;
 mod types;
-mod value;
+pub mod value;
 
 pub use swipl;
 use swipl::prelude::*;
