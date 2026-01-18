@@ -168,7 +168,7 @@ predicates! {
     /// Dead entries are stale weak references that should be cleaned up.
     pub semidet fn layer_cache_stats(_context, store_term, total_term, live_term, dead_term) {
         let store: WrappedStore = store_term.get_ex()?;
-        let (total, live, dead) = store.layer_cache_stats();
+        let (total, live, dead) = store.0.layer_cache_stats();
         total_term.unify(total as u64)?;
         live_term.unify(live as u64)?;
         dead_term.unify(dead as u64)
@@ -178,7 +178,7 @@ predicates! {
     /// Returns the number of entries removed.
     pub semidet fn cleanup_layer_cache(_context, store_term, removed_term) {
         let store: WrappedStore = store_term.get_ex()?;
-        let removed = store.cleanup_layer_cache();
+        let removed = store.0.cleanup_layer_cache();
         removed_term.unify(removed as u64)
     }
 
@@ -188,7 +188,7 @@ predicates! {
         let store: WrappedStore = store_term.get_ex()?;
         let layer_id_string: PrologText = layer_id_term.get_ex()?;
         let layer_id = context.try_or_die(string_to_name(&layer_id_string))?;
-        store.invalidate_layer(layer_id);
+        store.0.invalidate_layer(layer_id);
         Ok(())
     }
 }
