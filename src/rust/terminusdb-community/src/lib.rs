@@ -8,14 +8,14 @@ mod changes;
 mod consts;
 mod doc;
 mod embedding;
-mod graphql;
+pub mod graphql;
 mod json_preserve;
 mod path;
 mod prefix;
 mod schema;
 mod template;
 mod types;
-mod value;
+pub mod value;
 
 pub use swipl;
 use swipl::prelude::*;

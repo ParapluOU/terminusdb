@@ -26,11 +26,11 @@ fn post_process_graphql_numbers(json_str: String) -> String {
     NUM_MARKER_RE.replace_all(&json_str, "$1").to_string()
 }
 
-mod filter;
+pub mod filter;
 pub mod frame;
 mod main_graph;
 mod mutation;
-mod naming;
+pub mod naming;
 pub mod query;
 mod sanitize;
 pub mod schema;
