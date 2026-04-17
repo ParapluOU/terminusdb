@@ -8,6 +8,6 @@ debug = true
 [patch.crates-io]
 #tdb-succinct = {path="../../../tdb-succinct"}
 #terminus-store = {path="../../../terminusdb-store"}
-terminus-store = {git="https://github.com/terminusdb-org/terminusdb-store"}
+terminus-store = {git="https://github.com/terminusdb-org/terminusdb-store", rev="1c44c02"}
 swipl = {git="https://github.com/ParapluOU/swipl-rs", branch="master"}
 swipl-fli = {git="https://github.com/ParapluOU/swipl-rs", branch="master"}
