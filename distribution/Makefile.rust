@@ -74,5 +74,9 @@ realclean: clean
 $(TARGET): $(CARGO_BUILD_TARGET)
 	cp $< $@
 
+# MAKEFLAGS/MFLAGS are cleared for cargo: make places command-line variable
+# assignments (e.g. PROFILE=release) after a `--` in MAKEFLAGS, and cargo's
+# jobserver flags appended to that corrupt sub-make invocations in -sys crates
+# (tikv-jemalloc-sys fails with "No rule to make target '-j'").
 $(CARGO_BUILD_TARGET): $(shell find $(COMMUNITY_SRC_DIR) $(BUILD_DIR) -type f \( -name '*.rs' -o -name 'Cargo.*' \))
-	cd $(BUILD_DIR) && cargo build $(FEATURES) --profile $(PROFILE)
+	cd $(BUILD_DIR) && MAKEFLAGS= MFLAGS= cargo build $(FEATURES) --profile $(PROFILE)
