@@ -9,9 +9,8 @@ debug = true
 #tdb-succinct = {path="../../../tdb-succinct"}
 tdb-succinct = {git="https://github.com/terminusdb-org/tdb-succinct", branch="xbrl-json-iso-intervals"}
 #terminus-store = {path="../../../terminusdb-store"}
-terminus-store = {git="https://github.com/terminusdb-org/terminusdb-store"}
+#terminus-store = {git="https://github.com/terminusdb-org/terminusdb-store"}
+# Path-pinned to the ParapluOU Proof-of-WOQL store fork (branch parture-proof-of-woql).
+terminus-store = {path="../../../terminusdb-store-paraplu"}
 swipl = {git="https://github.com/terminusdb-org/swipl-rs"}
 #swipl = {path="../../../swipl-rs/swipl"}
-
-#[patch."https://github.com/terminusdb-org/terminusdb-store"]
-#terminus-store = {path="../../../terminusdb-store"}
