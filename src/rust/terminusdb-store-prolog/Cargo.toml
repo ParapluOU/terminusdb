@@ -26,3 +26,8 @@ base64 = "0.13"
 
 terminusdb-grpc-labelstore-client = { git="https://github.com/terminusdb-labs/terminusdb-grpc-labelstore", rev="cb8cf29" }
 tdb-succinct = "0.1.2"
+
+[dev-dependencies]
+# Same crate/version/features as the Proof-of-WOQL store fork, so ArkFr/ArkGT types
+# unify and the e2e test can independently reconstruct the expected result columns.
+dory-pcs = { version = "0.4.0", default-features = false, features = ["arkworks"] }
