@@ -179,6 +179,39 @@ fn caller_explicitly_compiles_proves_and_selects_the_trusted_root() {
     )
     .is_err());
 
+    // Count is delivered as its ordinary numeric binding, not as a Store dictionary ID.
+    // The envelope remains the complete BGP proof and authenticates its result length.
+    let count_query_json = query.to_woql_json().to_string();
+    let count_variables = vec!["count".into()];
+    let count_rows = vec![vec![2]];
+    let count_envelope = encode_executed_envelope(
+        &layer,
+        &compiled,
+        &proved,
+        commitment.state.commitment_root,
+        &count_variables,
+        &count_rows,
+    )
+    .unwrap();
+    decode_verify_executed_envelope(
+        &count_envelope,
+        &layer,
+        &count_query_json,
+        commitment.state.commitment_root,
+        &count_variables,
+        &count_rows,
+    )
+    .unwrap();
+    assert!(decode_verify_executed_envelope(
+        &count_envelope,
+        &layer,
+        &count_query_json,
+        commitment.state.commitment_root,
+        &count_variables,
+        &[vec![1]],
+    )
+    .is_err());
+
     let mut omitted_row = proved.result_columns.clone();
     omitted_row[0].pop();
     assert!(proved.verify_columns(&omitted_row).is_err());

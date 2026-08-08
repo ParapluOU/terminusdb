@@ -29,12 +29,16 @@ TERMINUSDB_QUERY_PROOF_RELEASE_TESTS=true \
   SWIPL_DIR="$DEPS/swipl-env/$TARGET/bin/"
 ```
 
-The suite is not marked concurrent and generates exactly one proof; all
-verification and tamper cases reuse its envelope. On 2026-08-09 the clean
+The suite is not marked concurrent and generates exactly two proofs: one
+projected BGP and one live `Count` over the same relation. All verification,
+reopen and tamper cases reuse those envelopes. On 2026-08-09 the clean
 release build took 215.47 seconds and the complete suite took 14.19 seconds
 (`user 13.79`, `sys 0.43`) on the development runner. CI should retain a
 5-minute suite timeout and record `/usr/bin/time` output for regressions. A
 debug-library run took approximately 3 minutes 30 seconds.
+
+After adding live `Count` coverage, the incremental optimized suite took 20.42
+seconds (`user 20.08`, `sys 0.37`) on the same runner.
 
 The ordinary PlUnit run leaves this suite blocked and performs no query-proof
 work. The suite additionally runs a normal `woql_query_json/9` `Limit` query;

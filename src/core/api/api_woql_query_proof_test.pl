@@ -180,6 +180,20 @@ query_proof_test_assert_json_semantics(JSON) :-
          get_dict('S', Binding, "http://example.com/proof/removed")
        ).
 
+query_proof_test_count_query(Query,
+                             _{'@type':'Count',
+                               query:Query,
+                               count:_{'@type':'DataValue', variable:"Count"}}).
+
+query_proof_test_assert_count_json(JSON) :-
+    ['Count'] = JSON.'api:variable_names',
+    [Binding] = JSON.bindings,
+    get_dict('Count', Binding, Count_Object),
+    is_dict(Count_Object),
+    get_dict('@type', Count_Object, 'xsd:decimal'),
+    get_dict('@value', Count_Object, Count),
+    Count =:= 5.
+
 query_proof_test_prepare_closed_archive(Dir, Payload) :-
     setup_unattached_store(Store-Dir),
     setup_call_cleanup(
@@ -216,7 +230,24 @@ query_proof_test_prepare_closed_archive(Dir, Payload) :-
           query_proof_verify_envelope(Verify_Layer, Query_Atom, Root,
                                       Variables, Rows, Envelope),
           query_proof_test_stage(native_verify_complete),
-          Payload = payload(Path,Query,Root,Envelope,Variables,Rows)
+          query_proof_test_count_query(Query, Count_Query),
+          query_proof_test_run(Path, Count_Query,
+                               _Ordinary_Count_Context, Ordinary_Count_JSON),
+          query_proof_test_run_with_proof(Path, Count_Query, Root,
+                                          _Proof_Count_Context, Proof_Count_JSON,
+                                          Count_Envelope),
+          query_proof_test_require(Ordinary_Count_JSON = Proof_Count_JSON,
+                                   ordinary_count_json_changed),
+          query_proof_test_require(query_proof_test_assert_count_json(Proof_Count_JSON),
+                                   count_json_semantics),
+          query_proof_test_execution_rows(Path, Count_Query, Count_Layer,
+                                          Count_Variables, Count_Rows),
+          atom_json_dict(Count_Query_Atom, Count_Query, []),
+          query_proof_verify_envelope(Count_Layer, Count_Query_Atom, Root,
+                                      Count_Variables, Count_Rows, Count_Envelope),
+          query_proof_test_stage(count_native_verify_complete),
+          Payload = payload(Path,Query,Root,Envelope,Variables,Rows,
+                            Count_Query,Count_Envelope,Count_Variables,Count_Rows)
         ),
         retract_local_triple_store(Store)),
     garbage_collect.
@@ -228,7 +259,8 @@ test(running_node_multilayer_archive_envelope,
      [ setup(api_woql:query_proof_test_prepare_closed_archive(Dir, Payload)),
        cleanup(delete_directory_and_contents(Dir))
      ]) :-
-    Payload = payload(Path,Query,Root,Envelope,Variables,Rows),
+    Payload = payload(Path,Query,Root,Envelope,Variables,Rows,
+                      Count_Query,Count_Envelope,Count_Variables,Count_Rows),
     open_archive_store(Dir, 8, Reopened),
     setup_call_cleanup(
         set_local_triple_store(Reopened),
@@ -269,7 +301,19 @@ test(running_node_multilayer_archive_envelope,
                   query_proof_verify_envelope(Layer, Query_Atom, Root,
                                               Variables, Missing_Row_Multiset, Envelope)),
               wrong_multiplicity_accepted),
-          query_proof_test_stage(wrong_multiplicity_rejected)
+          query_proof_test_stage(wrong_multiplicity_rejected),
+          query_proof_test_execution_rows(Path, Count_Query, Count_Layer,
+                                          Count_Variables, Count_Rows),
+          atom_json_dict(Count_Query_Atom, Count_Query, []),
+          query_proof_verify_envelope(Count_Layer, Count_Query_Atom, Root,
+                                      Count_Variables, Count_Rows, Count_Envelope),
+          query_proof_test_stage(count_reopen_verify_complete),
+          query_proof_test_require(
+              query_proof_test_rejected(
+                  query_proof_verify_envelope(Count_Layer, Count_Query_Atom, Root,
+                                              Count_Variables, [[4]], Count_Envelope)),
+              wrong_count_accepted),
+          query_proof_test_stage(wrong_count_rejected)
         ),
         retract_local_triple_store(Reopened)).
 

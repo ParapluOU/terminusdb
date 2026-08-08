@@ -92,6 +92,13 @@ run_context_ast_jsonld_response_(Context, AST, Requested_Data_Version, Transacti
                         transaction_retry_count : Meta_Data.transaction_retry_count }.
 
 proof_binding_row(none, _Context, _Transaction, []).
+proof_binding_row(some(Query_JSON, _, _), Context, _Transaction, [Count]) :-
+    query_proof_count_variable(Query_JSON, Count_Name),
+    !,
+    context_variable_names(Context, [Count_Name]),
+    member(Record, Context.bindings),
+    Record.var_name = Count_Name,
+    query_proof_count_value(Record.woql_var, Count).
 proof_binding_row(some(_, _, _), Context, Transaction, Row) :-
     context_variable_names(Context, Names),
     [Instance_Object] = Transaction.instance_objects,
@@ -110,6 +117,40 @@ proof_binding_id(Context, Layer, Name, Id) :-
     ->  object_id(Layer, lang(Lexical, Language), Id)
     ;   object_id(Layer, node(Value), Id)
     ).
+
+query_proof_json_type(JSON, Type) :-
+    get_dict('@type', JSON, Raw_Type),
+    ( atom(Raw_Type)
+    -> Type = Raw_Type
+    ;  atom_string(Type, Raw_Type)
+    ).
+
+% Mirror only the Count-bearing wrapper chain accepted by woql2::plan_bgp.
+% Rust remains authoritative and rejects any semantic mismatch; this traversal
+% solely chooses the wire representation for the ordinary Count result.
+query_proof_count_variable(Query, Name) :-
+    query_proof_json_type(Query, Count),
+    Count == 'Count',
+    Count_Value = Query.count,
+    get_dict(variable, Count_Value, Raw_Name),
+    ( atom(Raw_Name)
+    -> Name = Raw_Name
+    ;  atom_string(Name, Raw_Name)
+    ).
+query_proof_count_variable(Query, Name) :-
+    query_proof_json_type(Query, Wrapper),
+    memberchk(Wrapper, ['Select','Using','From','Pin','Immediately']),
+    query_proof_count_variable(Query.query, Name).
+
+query_proof_count_value(Value, Count) :-
+    ( integer(Value)
+    -> Count = Value
+    ;  Value = Lexical^^_Datatype,
+       integer(Lexical),
+       Count = Lexical
+    ),
+    Count >= 0,
+    Count =< 18446744073709551615.
 
 maybe_create_query_proof(none, _Context, _Transaction, _Rows).
 maybe_create_query_proof(some(Query_JSON, Expected_Root, Envelope), Context, Transaction, Rows) :-
