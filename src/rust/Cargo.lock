@@ -3609,9 +3609,11 @@ name = "terminusdb-woql2"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "decimal-rs",
  "derive_builder",
  "dory-pcs",
+ "hex",
  "serde",
  "serde_json",
  "tap",
