@@ -1,7 +1,7 @@
 use terminus_store::proof::CanonicalObject;
 use terminus_store::store::sync::open_sync_memory_store;
 use terminus_store::ValueTriple;
-use terminusdb_query_proof::{compile, prove};
+use terminusdb_query_proof::{compile, decode_and_verify_envelope, encode_envelope, prove};
 use terminusdb_woql2::misc::Count;
 use terminusdb_woql2::query::{And, Query};
 use terminusdb_woql2::triple::Triple;
@@ -87,6 +87,30 @@ fn caller_explicitly_compiles_proves_and_selects_the_trusted_root() {
             &wrong_object,
         )
         .is_err());
+
+    // Serialization and verification remain explicit caller actions. The boundary does
+    // not persist, publish, schedule, or automatically generate this envelope.
+    let encoded =
+        encode_envelope(&layer, &compiled, &proved, commitment.state.commitment_root).unwrap();
+    let decoded = decode_and_verify_envelope(
+        &encoded,
+        &layer,
+        &compiled,
+        commitment.state.commitment_root,
+    )
+    .unwrap();
+    assert_eq!(decoded.proved.result_len, proved.result_len);
+    assert_eq!(decoded.result_objects, objects);
+
+    let mut corrupt = encoded;
+    corrupt[24] ^= 1;
+    assert!(decode_and_verify_envelope(
+        &corrupt,
+        &layer,
+        &compiled,
+        commitment.state.commitment_root,
+    )
+    .is_err());
 
     let mut omitted_row = proved.result_columns.clone();
     omitted_row[0].pop();

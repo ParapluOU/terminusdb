@@ -7,7 +7,8 @@
 
 use terminus_store::store::sync::SyncStoreLayer;
 use terminusdb_woql2::proof::{
-    plan_bgp, BgpPlanError, CompiledBgp, ProvedBgp, QueryProofError,
+    decode_and_verify_envelope as decode_woql_envelope, plan_bgp, BgpPlanError, CompiledBgp,
+    ProvedBgp, QueryProofError, VerifiedBgpEnvelope,
 };
 use terminusdb_woql2::query::Query;
 
@@ -22,6 +23,39 @@ pub fn prove(
     compiled: &CompiledBgp,
 ) -> Result<ProvedBgp, QueryProofError> {
     compiled.prove_on_layer(layer)
+}
+
+/// Serialize an explicitly generated proof/result after verifying it against the
+/// caller-selected root. This chooses no storage, transport, or generation policy.
+pub fn encode_envelope(
+    layer: &SyncStoreLayer,
+    compiled: &CompiledBgp,
+    proved: &ProvedBgp,
+    expected_root: ProofHash,
+) -> Result<Vec<u8>, QueryProofError> {
+    let commitment = layer
+        .proof_commitment()?
+        .ok_or(QueryProofError::LayerNotProofEnabled)?;
+    Ok(proved.encode_envelope(compiled, &commitment, expected_root)?)
+}
+
+/// Decode and verify a portable proof/result against an independently compiled query,
+/// caller-selected layer, and trusted root.
+pub fn decode_and_verify_envelope(
+    bytes: &[u8],
+    layer: &SyncStoreLayer,
+    compiled: &CompiledBgp,
+    expected_root: ProofHash,
+) -> Result<VerifiedBgpEnvelope, QueryProofError> {
+    let commitment = layer
+        .proof_commitment()?
+        .ok_or(QueryProofError::LayerNotProofEnabled)?;
+    Ok(decode_woql_envelope(
+        bytes,
+        compiled,
+        &commitment,
+        expected_root,
+    )?)
 }
 
 pub use terminus_store::proof::ProofHash;
