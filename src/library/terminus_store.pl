@@ -87,12 +87,16 @@
               lru_cache_used_bytes/2,
               cleanup_layer_cache/2,
               invalidate_layer_cache_entry/2,
-              process_rss_bytes/1,
-
-              query_proof_layer_root/2,
-              query_proof_run_envelope/7,
-              query_proof_verify_envelope/7
+              process_rss_bytes/1
             ]).
+
+% Query-proof predicates live in TerminusDB's feature-gated monolithic dylib,
+% not in the standalone terminus-store foreign library.
+:- if(current_prolog_flag(terminusdb_monolithic_module, true)).
+:- export(query_proof_layer_root/2).
+:- export(query_proof_run_envelope/6).
+:- export(query_proof_verify_envelope/6).
+:- endif.
 
 terminus_store_version('0.19.8').
 
@@ -832,6 +836,15 @@ test(create_base_layer, [cleanup(clean(TestDir)), setup(createng(TestDir))]) :-
 test(create_base_layer_memory) :-
     open_memory_store(Store),
     open_write(Store, _).
+
+test(query_proof_requires_proof_enabled_layer,
+     [condition(current_predicate(query_proof_layer_root/2))]) :-
+    open_memory_store(Store),
+    open_write(Store, Builder),
+    nb_add_triple(Builder, "http://example.com/a", "http://example.com/p",
+                  node("http://example.com/b")),
+    nb_commit(Builder, Layer),
+    \+ query_proof_layer_root(Layer, _).
 
 test(write_value_triple, [cleanup(clean(TestDir)), setup(createng(TestDir))]) :-
     open_archive_store(TestDir, Store),

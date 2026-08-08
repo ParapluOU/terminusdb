@@ -22,7 +22,7 @@
 
 :- use_module(library(json)).
 :- use_module(library(terminus_store), [object_id/3,
-                                       query_proof_run_envelope/7]).
+                                       query_proof_run_envelope/6]).
 
 % Load document/json module to register json:json_write_hook/4 for rational precision
 % This must be loaded AFTER library(json) to ensure the multifile hook is registered

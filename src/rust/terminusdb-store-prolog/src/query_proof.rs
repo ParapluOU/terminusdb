@@ -43,7 +43,7 @@ predicates! {
             prove_executed_and_encode(&layer, &query_json, root, &variables, &rows)
                 .map_err(|error| invalid(error.to_string()))
         )?;
-        envelope_term.unify(envelope)
+        envelope_term.unify(envelope.as_slice())
     }
 
     /// Explicitly decode/verify an envelope and bind it independently to rows returned
