@@ -1,6 +1,7 @@
 :- module(query_response,[
               run_context_ast_jsonld_response/5,
               run_context_ast_jsonld_response/6,
+              run_context_ast_jsonld_response_with_proof/9,
               run_context_ast_jsonld_streaming_response/4,
               pretty_print_query_response/3
           ]).
@@ -19,6 +20,8 @@
 :- use_module(library(yall)).
 
 :- use_module(library(json)).
+:- use_module(library(terminus_store), [object_id/3,
+                                       query_proof_run_envelope/7]).
 
 % Load document/json module to register json:json_write_hook/4 for rational precision
 % This must be loaded AFTER library(json) to ensure the multifile hook is registered
@@ -33,6 +36,19 @@ run_context_ast_jsonld_response(Context, AST, Requested_Data_Version, Transactio
  * Code to generate bindings for query response in JSON-LD
  */
 run_context_ast_jsonld_response(Context, AST, Requested_Data_Version, Transaction_Meta_Data, Binding_JSON, Options) :-
+    run_context_ast_jsonld_response_(Context, AST, Requested_Data_Version,
+                                     Transaction_Meta_Data, Binding_JSON, Options,
+                                     none).
+
+run_context_ast_jsonld_response_with_proof(Context, AST, Query_JSON, Expected_Root,
+                                           Requested_Data_Version, Transaction_Meta_Data,
+                                           Binding_JSON, Envelope, Options) :-
+    run_context_ast_jsonld_response_(Context, AST, Requested_Data_Version,
+                                     Transaction_Meta_Data, Binding_JSON, Options,
+                                     some(Query_JSON, Expected_Root, Envelope)).
+
+run_context_ast_jsonld_response_(Context, AST, Requested_Data_Version, Transaction_Meta_Data,
+                                 Binding_JSON, Options, Proof_Request) :-
     compile_query(AST,Prog,Context,Output_Context,Options),
     do_or_die(
         query_default_collection(Output_Context, Transaction),
@@ -42,13 +58,23 @@ run_context_ast_jsonld_response(Context, AST, Requested_Data_Version, Transactio
     with_transaction(
         Output_Context,
         query_response:(
-            findall(JSON_Binding,
+            % Prog occurs only here: proof mode captures IDs alongside the ordinary
+            % JSON binding during one enumeration per transaction attempt, never by
+            % replaying the query for proof generation. The existing transaction retry
+            % mechanism may, as for the non-proof path, replay an entire failed attempt.
+            findall(JSON_Binding-Proof_Row,
                     (   woql_compile:Prog,
                         get_dict(bindings, Output_Context, Bindings),
                         * json_log_info_formatted('~N[Bindings] ~q~n', [Bindings]),
-                        json_transform_binding_set(Output_Context, Bindings, JSON_Binding)),
-                    Binding_Set),
-            * json_log_info_formatted('~N[Binding Set] ~q~n', [Binding_Set])
+                        json_transform_binding_set(Output_Context, Bindings, JSON_Binding),
+                        proof_binding_row(Proof_Request, Output_Context, Transaction, Proof_Row)),
+                    Binding_Rows),
+            pairs_keys_values(Binding_Rows, Binding_Set, Proof_Rows),
+            % Keep proof generation inside the transaction body. object_id/3 above and
+            % the native proof boundary below therefore use the exact same immutable
+            % Transaction.instance_objects[0].read layer that Prog queried.
+            maybe_create_query_proof(Proof_Request, Output_Context, Transaction, Proof_Rows),
+            * json_log_info_formatted('~N[Binding Rows] ~q~n', [Binding_Rows])
         ),
         Meta_Data
     ),
@@ -63,6 +89,36 @@ run_context_ast_jsonld_response(Context, AST, Requested_Data_Version, Transactio
                         inserts : Meta_Data.inserts,
                         deletes : Meta_Data.deletes,
                         transaction_retry_count : Meta_Data.transaction_retry_count }.
+
+proof_binding_row(none, _Context, _Transaction, []).
+proof_binding_row(some(_, _, _), Context, Transaction, Row) :-
+    context_variable_names(Context, Names),
+    [Instance_Object] = Transaction.instance_objects,
+    Layer = Instance_Object.read,
+    maplist({Context,Layer}/[Name,Id]>>proof_binding_id(Context, Layer, Name, Id), Names, Row).
+
+proof_binding_id(Context, Layer, Name, Id) :-
+    member(Record, Context.bindings),
+    Record.var_name = Name,
+    Value = Record.woql_var,
+    (   var(Value)
+    ->  throw(error(query_proof_unbound_result(Name), _))
+    ;   Value = Lexical^^Datatype
+    ->  object_id(Layer, value(Lexical, Datatype), Id)
+    ;   Value = Lexical@Language
+    ->  object_id(Layer, lang(Lexical, Language), Id)
+    ;   object_id(Layer, node(Value), Id)
+    ).
+
+maybe_create_query_proof(none, _Context, _Transaction, _Rows).
+maybe_create_query_proof(some(Query_JSON, Expected_Root, Envelope), Context, Transaction, Rows) :-
+    context_variable_names(Context, Names),
+    maplist(atom_string, Names, Variable_Strings),
+    [Instance_Object] = Transaction.instance_objects,
+    Layer = Instance_Object.read,
+    atom_json_dict(Query_Atom, Query_JSON, []),
+    query_proof_run_envelope(Layer, Query_Atom, Expected_Root,
+                             Variable_Strings, Rows, Envelope).
 
 
 run_context_ast_jsonld_streaming_response(Context, AST, Requested_Data_Version, Options) :-

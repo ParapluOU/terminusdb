@@ -1,4 +1,6 @@
-:- module(api_woql, [woql_query_json/9, woql_query_streaming_json/5]).
+:- module(api_woql, [woql_query_json/9,
+                     woql_query_json_with_proof/11,
+                     woql_query_streaming_json/5]).
 :- use_module(core(util)).
 :- use_module(core(query)).
 :- use_module(core(transaction)).
@@ -74,6 +76,25 @@ woql_query_streaming_json(System_DB, Auth, Path_Option, Query, Options) :-
 woql_query_json(System_DB, Auth, Path_Option, Query, Context, New_Data_Version, Transaction_Meta_Data, JSON, Options) :-
     prepare_woql_query(System_DB, Auth, Path_Option, Query, AST, Context, Requested_Data_Version, Options),
     run_context_ast_jsonld_response(Context, AST, Requested_Data_Version, Transaction_Meta_Data, JSON, Options),
+    query_default_collection(Context, Transaction),
+    meta_data_version(Transaction, Transaction_Meta_Data, New_Data_Version).
+
+% Explicit application/domain entry point. It enumerates the ordinary WOQL program once
+% per transaction attempt and asks Rust to prove the captured Store-ID row multiset,
+% without a second proof-only execution. Normal transaction retry semantics are
+% unchanged. No route calls this predicate automatically and no envelope is persisted.
+woql_query_json_with_proof(System_DB, Auth, Path_Option, Query, Expected_Root,
+                           Context, New_Data_Version, Transaction_Meta_Data,
+                           JSON, Envelope, Options) :-
+    prepare_woql_query(System_DB, Auth, Path_Option, Query, AST, Context,
+                       Requested_Data_Version, Options),
+    (   Query = json_query(Query_JSON)
+    ->  true
+    ;   throw(error(query_proof_requires_json_query, _))
+    ),
+    run_context_ast_jsonld_response_with_proof(
+        Context, AST, Query_JSON, Expected_Root, Requested_Data_Version,
+        Transaction_Meta_Data, JSON, Envelope, Options),
     query_default_collection(Context, Transaction),
     meta_data_version(Transaction, Transaction_Meta_Data, New_Data_Version).
 

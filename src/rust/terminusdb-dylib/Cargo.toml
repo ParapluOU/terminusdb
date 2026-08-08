@@ -14,7 +14,7 @@ jemalloc-bg-threads = ["tikv-jemallocator/background_threads"]
 
 [dependencies]
 terminusdb-community = {path="../terminusdb-community"}
-terminusdb-store-prolog = {path="../terminusdb-store-prolog"}
+terminusdb-store-prolog = {path="../terminusdb-store-prolog", features=["query-proof"]}
 terminusdb-webserver = {path="../terminusdb-webserver"}
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]

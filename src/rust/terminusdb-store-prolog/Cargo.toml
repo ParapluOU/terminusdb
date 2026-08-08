@@ -9,6 +9,7 @@ publish = false
 
 [features]
 rollup_metadata_experimental = ["terminus-store/rollup_metadata_experimental"]
+query-proof = ["dep:terminusdb-query-proof"]
 
 [dependencies]
 swipl = {version="0.3.16", features=["serde"]}
@@ -27,7 +28,7 @@ base64 = "0.13"
 terminusdb-grpc-labelstore-client = { git="https://github.com/terminusdb-labs/terminusdb-grpc-labelstore", rev="cb8cf29" }
 tdb-succinct = "0.1.2"
 # Explicit compile/prove/verify boundary; contains no scheduling policy.
-terminusdb-query-proof = { path = "../terminusdb-query-proof" }
+terminusdb-query-proof = { path = "../terminusdb-query-proof", optional = true }
 
 [dev-dependencies]
 # Same crate/version/features as the Proof-of-WOQL store fork, so ArkFr/ArkGT types

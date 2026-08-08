@@ -87,7 +87,11 @@
               lru_cache_used_bytes/2,
               cleanup_layer_cache/2,
               invalidate_layer_cache_entry/2,
-              process_rss_bytes/1
+              process_rss_bytes/1,
+
+              query_proof_layer_root/2,
+              query_proof_run_envelope/7,
+              query_proof_verify_envelope/7
             ]).
 
 terminus_store_version('0.19.8').

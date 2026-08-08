@@ -3500,8 +3500,10 @@ dependencies = [
 name = "terminusdb-query-proof"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "terminus-store",
  "terminusdb-woql2",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

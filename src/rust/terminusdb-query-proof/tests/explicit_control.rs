@@ -1,7 +1,10 @@
 use terminus_store::proof::CanonicalObject;
 use terminus_store::store::sync::open_sync_memory_store;
 use terminus_store::ValueTriple;
-use terminusdb_query_proof::{compile, decode_and_verify_envelope, encode_envelope, prove};
+use terminusdb_query_proof::{
+    compile, compile_json, decode_and_verify_envelope, decode_verify_executed_envelope,
+    encode_envelope, encode_executed_envelope, prove,
+};
 use terminusdb_woql2::misc::Count;
 use terminusdb_woql2::query::{And, Query};
 use terminusdb_woql2::triple::Triple;
@@ -43,8 +46,13 @@ fn caller_explicitly_compiles_proves_and_selects_the_trusted_root() {
     let bgp = Query::And(And {
         and: vec![triple("x", "knows", "y"), triple("y", "knows", "z")],
     });
+    // Exercise the node's normalized JSON boundary before the expensive proof work so
+    // deserialization failures remain cheap and local.
+    let query_json = bgp.to_woql_json().to_string();
+    let executed_compiled = compile_json(&query_json).unwrap();
+    assert_eq!(executed_compiled.schema, vec!["x", "y", "z"]);
     let query = Query::Count(Count {
-        query: Box::new(bgp),
+        query: Box::new(bgp.clone()),
         count: DataValue::Variable("count".into()),
     });
 
@@ -109,6 +117,65 @@ fn caller_explicitly_compiles_proves_and_selects_the_trusted_root() {
         &layer,
         &compiled,
         commitment.state.commitment_root,
+    )
+    .is_err());
+
+    // The running node receives this normalized JSON and executes the same BGP through
+    // Prolog. Its raw bindings are resolved to IDs before JSON-LD prefix rendering.
+    let id = |name: &str| {
+        commitment
+            .node_value_catalog
+            .iter()
+            .find(|record| record.triple.object == CanonicalObject::Node(iri(name).into_bytes()))
+            .unwrap()
+            .object_id
+    };
+    let variables = vec!["x".into(), "y".into(), "z".into()];
+    // Deliberately reverse the ordinary executor's row order; WOQL result order is not
+    // semantic, while duplicate multiplicity remains exact.
+    let executed_rows = vec![
+        vec![id("b"), id("c"), id("d")],
+        vec![id("a"), id("b"), id("c")],
+    ];
+    let executed_envelope = encode_executed_envelope(
+        &layer,
+        &executed_compiled,
+        &proved,
+        commitment.state.commitment_root,
+        &variables,
+        &executed_rows,
+    )
+    .unwrap();
+    decode_verify_executed_envelope(
+        &executed_envelope,
+        &layer,
+        &query_json,
+        commitment.state.commitment_root,
+        &variables,
+        &executed_rows,
+    )
+    .unwrap();
+
+    let duplicate_rows = vec![executed_rows[0].clone(), executed_rows[0].clone()];
+    assert!(decode_verify_executed_envelope(
+        &executed_envelope,
+        &layer,
+        &query_json,
+        commitment.state.commitment_root,
+        &variables,
+        &duplicate_rows,
+    )
+    .is_err());
+
+    let mut forged_rows = executed_rows.clone();
+    forged_rows[0][2] = id("z");
+    assert!(decode_verify_executed_envelope(
+        &executed_envelope,
+        &layer,
+        &query_json,
+        commitment.state.commitment_root,
+        &variables,
+        &forged_rows,
     )
     .is_err());
 

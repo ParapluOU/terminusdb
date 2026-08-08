@@ -1,12 +1,15 @@
 pub mod builder;
 pub mod layer;
 pub mod named_graph;
+#[cfg(feature = "query-proof")]
+pub mod query_proof;
 pub mod store;
 pub mod value;
 
 pub use swipl;
 pub use terminus_store;
-pub use terminusdb_query_proof as query_proof;
+#[cfg(feature = "query-proof")]
+pub use terminusdb_query_proof as query_proof_core;
 
 pub fn install(module: Option<&str>) {
     store::register_open_memory_store_in_module(module);
@@ -74,4 +77,10 @@ pub fn install(module: Option<&str>) {
     store::register_cleanup_layer_cache_in_module(module);
     store::register_invalidate_layer_cache_entry_in_module(module);
     store::register_process_rss_bytes_in_module(module);
+    #[cfg(feature = "query-proof")]
+    {
+        query_proof::register_query_proof_layer_root_in_module(module);
+        query_proof::register_query_proof_run_envelope_in_module(module);
+        query_proof::register_query_proof_verify_envelope_in_module(module);
+    }
 }
