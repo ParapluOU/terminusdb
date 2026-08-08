@@ -837,14 +837,15 @@ test(create_base_layer_memory) :-
     open_memory_store(Store),
     open_write(Store, _).
 
-test(query_proof_requires_proof_enabled_layer,
+test(query_proof_root_exists_for_every_committed_layer,
      [condition(current_predicate(query_proof_layer_root/2))]) :-
     open_memory_store(Store),
     open_write(Store, Builder),
     nb_add_triple(Builder, "http://example.com/a", "http://example.com/p",
                   node("http://example.com/b")),
     nb_commit(Builder, Layer),
-    \+ query_proof_layer_root(Layer, _).
+    query_proof_layer_root(Layer, Root),
+    string_length(Root, 64).
 
 test(write_value_triple, [cleanup(clean(TestDir)), setup(createng(TestDir))]) :-
     open_archive_store(TestDir, Store),

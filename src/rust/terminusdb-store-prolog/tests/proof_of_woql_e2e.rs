@@ -2,7 +2,7 @@
 //!
 //! Builds a base layer of triples through the SAME `terminus_store` store API that
 //! terminusdb-store-prolog's foreign predicates wrap (`create_base_layer` ->
-//! `add_value_triple` -> `commit_with_proof`), materializes its authenticated
+//! `add_value_triple` -> `commit`), materializes its authenticated
 //! `LayerCommitment` (`proof_commitment`), and then drives the fork's Proof-of-WOQL
 //! query API (`prove/verify_layer_graph_pattern2`, `prove/verify_layer_filter`) to
 //! produce AND verify a proof against the layer's committed root. This demonstrates
@@ -39,8 +39,8 @@ fn build_layer(triples: &[(&str, &str, &str)]) -> Arc<LayerCommitment> {
             .add_value_triple(ValueTriple::new_node(&iri(s), &iri(p), &iri(o)))
             .unwrap();
     }
-    let (layer, _state) = builder.commit_with_proof().unwrap();
-    layer.proof_commitment().unwrap().unwrap()
+    let layer = builder.commit().unwrap();
+    layer.proof_commitment().unwrap()
 }
 
 #[test]

@@ -47,9 +47,7 @@ pub fn encode_envelope(
     proved: &ProvedBgp,
     expected_root: ProofHash,
 ) -> Result<Vec<u8>, QueryProofError> {
-    let commitment = layer
-        .proof_commitment()?
-        .ok_or(QueryProofError::LayerNotProofEnabled)?;
+    let commitment = layer.proof_commitment()?;
     Ok(proved.encode_envelope(compiled, &commitment, expected_root)?)
 }
 
@@ -61,9 +59,7 @@ pub fn decode_and_verify_envelope(
     compiled: &CompiledBgp,
     expected_root: ProofHash,
 ) -> Result<VerifiedBgpEnvelope, QueryProofError> {
-    let commitment = layer
-        .proof_commitment()?
-        .ok_or(QueryProofError::LayerNotProofEnabled)?;
+    let commitment = layer.proof_commitment()?;
     Ok(decode_woql_envelope(
         bytes,
         compiled,
@@ -103,9 +99,7 @@ pub fn encode_executed_envelope(
     variables: &[String],
     rows: &[Vec<u64>],
 ) -> Result<Vec<u8>, QueryProofError> {
-    let commitment = layer
-        .proof_commitment()?
-        .ok_or(QueryProofError::LayerNotProofEnabled)?;
+    let commitment = layer.proof_commitment()?;
     proved.verify_executed_rows(compiled, &commitment, expected_root, variables, rows)?;
     Ok(proved.encode_envelope(compiled, &commitment, expected_root)?)
 }
@@ -122,9 +116,7 @@ pub fn decode_verify_executed_envelope(
 ) -> Result<VerifiedBgpEnvelope, ExecutionProofError> {
     let compiled = compile_json(query_json)?;
     let verified = decode_and_verify_envelope(bytes, layer, &compiled, expected_root)?;
-    let commitment = layer
-        .proof_commitment()?
-        .ok_or(QueryProofError::LayerNotProofEnabled)?;
+    let commitment = layer.proof_commitment()?;
     verified
         .proved
         .verify_executed_rows(&compiled, &commitment, expected_root, variables, rows)?;

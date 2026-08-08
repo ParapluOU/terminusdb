@@ -41,7 +41,7 @@ fn caller_explicitly_compiles_proves_and_selects_the_trusted_root() {
             ))
             .unwrap();
     }
-    let (layer, _) = builder.commit_with_proof().unwrap();
+    let layer = builder.commit().unwrap();
 
     let bgp = Query::And(And {
         and: vec![triple("x", "knows", "y"), triple("y", "knows", "z")],
@@ -71,7 +71,7 @@ fn caller_explicitly_compiles_proves_and_selects_the_trusted_root() {
     assert_eq!(proved.projected_commitments(&compiled).count(), 0);
     assert_eq!(proved.projected_columns(&compiled).count(), 0);
 
-    let commitment = layer.proof_commitment().unwrap().unwrap();
+    let commitment = layer.proof_commitment().unwrap();
     proved
         .verify(&compiled, &commitment, commitment.state.commitment_root)
         .unwrap();

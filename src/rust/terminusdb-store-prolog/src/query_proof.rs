@@ -22,11 +22,10 @@ fn expected_root(text: &str) -> io::Result<ProofHash> {
 }
 
 predicates! {
-    /// Return the proof root for an explicitly selected proof-enabled layer.
+    /// Return the proof root for an explicitly selected committed layer.
     pub semidet fn query_proof_layer_root(context, layer_term, root_term) {
         let layer: WrappedLayer = layer_term.get_ex()?;
-        let commitment = context.try_or_die(layer.proof_commitment())?
-            .ok_or(PrologError::Failure)?;
+        let commitment = context.try_or_die(layer.proof_commitment())?;
         root_term.unify(hex::encode(commitment.state.commitment_root))
     }
 
