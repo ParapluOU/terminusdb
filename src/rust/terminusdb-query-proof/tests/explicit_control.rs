@@ -1,3 +1,4 @@
+use terminus_store::proof::CanonicalObject;
 use terminus_store::store::sync::open_sync_memory_store;
 use terminus_store::ValueTriple;
 use terminusdb_query_proof::{compile, prove};
@@ -66,6 +67,26 @@ fn caller_explicitly_compiles_proves_and_selects_the_trusted_root() {
     proved
         .verify(&compiled, &commitment, commitment.state.commitment_root)
         .unwrap();
+
+    let objects = proved
+        .verify_and_resolve(&compiled, &commitment, commitment.state.commitment_root)
+        .unwrap();
+    assert_eq!(objects.len(), 3);
+    assert!(objects.iter().flatten().all(|object| matches!(
+        object,
+        CanonicalObject::Node(iri) if iri.starts_with(b"http://ex/")
+    )));
+
+    let mut wrong_object = objects.clone();
+    wrong_object[0][0] = CanonicalObject::Node(iri("forged").into_bytes());
+    assert!(proved
+        .verify_objects(
+            &compiled,
+            &commitment,
+            commitment.state.commitment_root,
+            &wrong_object,
+        )
+        .is_err());
 
     let mut omitted_row = proved.result_columns.clone();
     omitted_row[0].pop();
