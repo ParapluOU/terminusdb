@@ -9,3 +9,6 @@ terminus-store = { version = "0.21.8", features = [] }
 terminusdb-woql2 = { path = "../../../../terminusdb-rs/crates/woql2", features = ["proof"] }
 serde_json = "1.0"
 thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

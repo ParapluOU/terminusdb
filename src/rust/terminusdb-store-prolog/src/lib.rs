@@ -79,6 +79,7 @@ pub fn install(module: Option<&str>) {
     store::register_process_rss_bytes_in_module(module);
     #[cfg(feature = "query-proof")]
     {
+        query_proof::register_query_proof_migrate_layer_in_module(module);
         query_proof::register_query_proof_layer_root_in_module(module);
         query_proof::register_query_proof_run_envelope_in_module(module);
         query_proof::register_query_proof_verify_envelope_in_module(module);

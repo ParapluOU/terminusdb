@@ -5,7 +5,10 @@
 //! and when to invoke [`prove`]. Verification always requires a caller-selected trusted
 //! root.
 
-use terminus_store::store::sync::SyncStoreLayer;
+use std::io;
+
+use terminus_store::layer::Layer;
+use terminus_store::store::sync::{SyncStore, SyncStoreLayer};
 use terminusdb_woql2::proof::{
     decode_and_verify_envelope as decode_woql_envelope, plan_bgp, BgpPlanError, CompiledBgp,
     ProvedBgp, QueryProofError, VerifiedBgpEnvelope,
@@ -21,6 +24,75 @@ pub enum ExecutionProofError {
     Proof(#[from] QueryProofError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+/// Outcome of an explicitly requested migration of one immutable layer head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MigrationStatus {
+    /// The exact selected head already had a valid current PF4 commitment chain.
+    AlreadyCurrent,
+    /// Store migrated at least one missing/legacy sidecar in the selected chain.
+    Migrated,
+}
+
+impl MigrationStatus {
+    pub fn as_atom(self) -> &'static str {
+        match self {
+            Self::AlreadyCurrent => "already_current",
+            Self::Migrated => "migrated",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MigrationOutcome {
+    pub layer_id: [u32; 5],
+    pub trusted_root: ProofHash,
+    pub status: MigrationStatus,
+}
+
+/// Explicitly migrate the proof chain ending at exactly `layer_id`.
+///
+/// This is a low-level privileged primitive: routing and authorization remain with
+/// the caller that owns `store`. It never resolves a mutable named-graph head and
+/// is never invoked by open/query/startup paths. Store owns all v3 validation and
+/// compare-and-swap replacement logic.
+pub fn migrate_legacy_chain(store: &SyncStore, layer_id: [u32; 5]) -> io::Result<MigrationOutcome> {
+    // Store is the sole legacy admission point and derives status inside the
+    // migration/CAS operation, without a racy before/after observation.
+    let migration = store.migrate_proof_chain_with_status(layer_id)?;
+
+    // Report success only after reopening and validating the exact immutable head.
+    // A failed/interrupted chain or concurrent CAS race returns an error before this.
+    let persisted = store.get_layer_from_id(layer_id)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "requested migration layer disappeared after migration",
+        )
+    })?;
+    if persisted.name() != layer_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "post-migration store resolved a different layer than requested",
+        ));
+    }
+    let persisted_state = persisted.proof_commitment()?.state.clone();
+    if persisted_state != migration.state {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "migration did not persist the complete reported v4 head state",
+        ));
+    }
+
+    Ok(MigrationOutcome {
+        layer_id,
+        trusted_root: persisted_state.commitment_root,
+        status: if migration.migrated {
+            MigrationStatus::Migrated
+        } else {
+            MigrationStatus::AlreadyCurrent
+        },
+    })
 }
 
 /// Compile and shape-check a WOQL query without generating a proof.

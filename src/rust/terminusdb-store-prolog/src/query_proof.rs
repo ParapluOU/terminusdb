@@ -5,10 +5,12 @@ use std::io;
 
 use swipl::prelude::*;
 use terminusdb_query_proof::{
-    decode_verify_executed_envelope, prove_executed_and_encode, ProofHash,
+    decode_verify_executed_envelope, migrate_legacy_chain, prove_executed_and_encode, ProofHash,
 };
 
 use crate::layer::WrappedLayer;
+use crate::store::WrappedStore;
+use terminus_store::storage::string_to_name;
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
@@ -22,6 +24,18 @@ fn expected_root(text: &str) -> io::Result<ProofHash> {
 }
 
 predicates! {
+    /// Explicitly migrate the intrinsic proof chain ending at exactly `layer_id`
+    /// in the caller-supplied Store. This does not resolve or follow a mutable graph
+    /// head and is never called by open/query/startup paths.
+    pub semidet fn query_proof_migrate_layer(context, store_term, layer_id_term, root_term, status_term) {
+        let store: WrappedStore = store_term.get_ex()?;
+        let layer_id_text: PrologText = layer_id_term.get_ex()?;
+        let layer_id = context.try_or_die(string_to_name(&layer_id_text))?;
+        let outcome = context.try_or_die(migrate_legacy_chain(&store, layer_id))?;
+        root_term.unify(hex::encode(outcome.trusted_root))?;
+        status_term.unify(Atom::new(outcome.status.as_atom()))
+    }
+
     /// Return the proof root for an explicitly selected committed layer.
     pub semidet fn query_proof_layer_root(context, layer_term, root_term) {
         let layer: WrappedLayer = layer_term.get_ex()?;

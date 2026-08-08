@@ -93,6 +93,7 @@
 % Query-proof predicates live in TerminusDB's feature-gated monolithic dylib,
 % not in the standalone terminus-store foreign library.
 :- if(current_prolog_flag(terminusdb_monolithic_module, true)).
+:- export(query_proof_migrate_layer/4).
 :- export(query_proof_layer_root/2).
 :- export(query_proof_run_envelope/6).
 :- export(query_proof_verify_envelope/6).
@@ -846,6 +847,20 @@ test(query_proof_root_exists_for_every_committed_layer,
     nb_commit(Builder, Layer),
     query_proof_layer_root(Layer, Root),
     string_length(Root, 64).
+
+test(query_proof_migration_is_explicit_exact_and_idempotent,
+     [condition(current_predicate(query_proof_migrate_layer/4))]) :-
+    open_memory_store(Store),
+    open_write(Store, Builder),
+    nb_add_triple(Builder, "http://example.com/migrate", "http://example.com/p",
+                  node("http://example.com/o")),
+    nb_commit(Builder, Layer),
+    layer_to_id(Layer, Layer_Id),
+    query_proof_migrate_layer(Store, Layer_Id, Root_1, already_current),
+    query_proof_migrate_layer(Store, Layer_Id, Root_2, already_current),
+    Root_1 = Root_2,
+    query_proof_layer_root(Layer, Root_1),
+    string_length(Root_1, 64).
 
 test(write_value_triple, [cleanup(clean(TestDir)), setup(createng(TestDir))]) :-
     open_archive_store(TestDir, Store),
