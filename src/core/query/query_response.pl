@@ -17,6 +17,7 @@
 
 :- use_module(library(apply)).
 :- use_module(library(lists)).
+:- use_module(library(pairs)).
 :- use_module(library(yall)).
 
 :- use_module(library(json)).
