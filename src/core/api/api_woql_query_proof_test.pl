@@ -194,6 +194,28 @@ query_proof_test_assert_count_json(JSON) :-
     get_dict('@value', Count_Object, Count),
     Count =:= 5.
 
+query_proof_test_ground_queries(Present, Absent) :-
+    query_proof_test_node("http://example.com/proof/alice", Alice),
+    query_proof_test_node("http://example.com/proof/p", Predicate),
+    query_proof_test_node_value("http://example.com/proof/bob", Bob),
+    query_proof_test_node_value("http://example.com/proof/erin", Erin),
+    Present = _{'@type':'Triple', subject:Alice, predicate:Predicate, object:Bob},
+    Absent = _{'@type':'Triple', subject:Alice, predicate:Predicate, object:Erin}.
+
+query_proof_test_ground_case(Path, Query, Root, Expected_Bindings,
+                             Envelope, Variables, Rows) :-
+    query_proof_test_run(Path, Query, _Ordinary_Context, Ordinary_JSON),
+    query_proof_test_run_with_proof(Path, Query, Root, _Proof_Context,
+                                    Proof_JSON, Envelope),
+    query_proof_test_require(Ordinary_JSON = Proof_JSON, ground_json_changed),
+    query_proof_test_require(Proof_JSON.'api:variable_names' = [],
+                             ground_variables_changed),
+    query_proof_test_require(Proof_JSON.bindings = Expected_Bindings,
+                             ground_bindings_changed),
+    query_proof_test_execution_rows(Path, Query, Layer, Variables, Rows),
+    atom_json_dict(Query_Atom, Query, []),
+    query_proof_verify_envelope(Layer, Query_Atom, Root, Variables, Rows, Envelope).
+
 query_proof_test_prepare_closed_archive(Dir, Payload) :-
     setup_unattached_store(Store-Dir),
     setup_call_cleanup(
@@ -246,8 +268,19 @@ query_proof_test_prepare_closed_archive(Dir, Payload) :-
           query_proof_verify_envelope(Count_Layer, Count_Query_Atom, Root,
                                       Count_Variables, Count_Rows, Count_Envelope),
           query_proof_test_stage(count_native_verify_complete),
+          query_proof_test_ground_queries(Present_Ground, Absent_Ground),
+          query_proof_test_ground_case(Path, Present_Ground, Root, [_{}],
+                                       Present_Envelope, Present_Variables, Present_Rows),
+          query_proof_test_require(Present_Rows = [[]], present_ground_rows_changed),
+          query_proof_test_stage(present_ground_native_verify_complete),
+          query_proof_test_ground_case(Path, Absent_Ground, Root, [],
+                                       Absent_Envelope, Absent_Variables, Absent_Rows),
+          query_proof_test_require(Absent_Rows = [], absent_ground_rows_changed),
+          query_proof_test_stage(absent_ground_native_verify_complete),
           Payload = payload(Path,Query,Root,Envelope,Variables,Rows,
-                            Count_Query,Count_Envelope,Count_Variables,Count_Rows)
+                            Count_Query,Count_Envelope,Count_Variables,Count_Rows,
+                            Present_Ground,Present_Envelope,Present_Variables,Present_Rows,
+                            Absent_Ground,Absent_Envelope,Absent_Variables,Absent_Rows)
         ),
         retract_local_triple_store(Store)),
     garbage_collect.
@@ -260,7 +293,9 @@ test(running_node_multilayer_archive_envelope,
        cleanup(delete_directory_and_contents(Dir))
      ]) :-
     Payload = payload(Path,Query,Root,Envelope,Variables,Rows,
-                      Count_Query,Count_Envelope,Count_Variables,Count_Rows),
+                      Count_Query,Count_Envelope,Count_Variables,Count_Rows,
+                      Present_Ground,Present_Envelope,Present_Variables,Present_Rows,
+                      Absent_Ground,Absent_Envelope,Absent_Variables,Absent_Rows),
     open_archive_store(Dir, 8, Reopened),
     setup_call_cleanup(
         set_local_triple_store(Reopened),
@@ -313,7 +348,29 @@ test(running_node_multilayer_archive_envelope,
                   query_proof_verify_envelope(Count_Layer, Count_Query_Atom, Root,
                                               Count_Variables, [[4]], Count_Envelope)),
               wrong_count_accepted),
-          query_proof_test_stage(wrong_count_rejected)
+          query_proof_test_stage(wrong_count_rejected),
+          query_proof_test_execution_rows(Path, Present_Ground, Present_Layer,
+                                          Present_Variables, Present_Rows),
+          atom_json_dict(Present_Atom, Present_Ground, []),
+          query_proof_verify_envelope(Present_Layer, Present_Atom, Root,
+                                      Present_Variables, Present_Rows, Present_Envelope),
+          query_proof_test_require(
+              query_proof_test_rejected(
+                  query_proof_verify_envelope(Present_Layer, Present_Atom, Root,
+                                              Present_Variables, [], Present_Envelope)),
+              present_ground_omission_accepted),
+          query_proof_test_stage(present_ground_reopen_verify_complete),
+          query_proof_test_execution_rows(Path, Absent_Ground, Absent_Layer,
+                                          Absent_Variables, Absent_Rows),
+          atom_json_dict(Absent_Atom, Absent_Ground, []),
+          query_proof_verify_envelope(Absent_Layer, Absent_Atom, Root,
+                                      Absent_Variables, Absent_Rows, Absent_Envelope),
+          query_proof_test_require(
+              query_proof_test_rejected(
+                  query_proof_verify_envelope(Absent_Layer, Absent_Atom, Root,
+                                              Absent_Variables, [[]], Absent_Envelope)),
+              absent_ground_insertion_accepted),
+          query_proof_test_stage(absent_ground_reopen_verify_complete)
         ),
         retract_local_triple_store(Reopened)).
 
