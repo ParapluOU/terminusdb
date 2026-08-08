@@ -6,6 +6,7 @@ pub mod value;
 
 pub use swipl;
 pub use terminus_store;
+pub use terminusdb_query_proof as query_proof;
 
 pub fn install(module: Option<&str>) {
     store::register_open_memory_store_in_module(module);

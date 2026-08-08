@@ -1,0 +1,9 @@
+[package]
+name = "terminusdb-query-proof"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+terminus-store = { version = "0.21.8", features = [] }
+terminusdb-woql2 = { path = "../../../../terminusdb-rs/crates/woql2", features = ["proof"] }
