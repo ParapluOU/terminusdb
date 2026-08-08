@@ -106,3 +106,10 @@ bind_vars([Name=Var|Tail],AST) :-
 atom_woql(Query, AST) :-
     read_term_from_atom(Query, AST, [variable_names(Names)]),
     bind_vars(Names,AST).
+
+% Expensive, explicitly enabled monolithic-node proof tests. Keeping these in a
+% separate include lets release CI select the serial suite without adding proof
+% work to the ordinary test run.
+:- if(current_prolog_flag(terminusdb_monolithic_module, true)).
+:- include('api_woql_query_proof_test.pl').
+:- endif.
