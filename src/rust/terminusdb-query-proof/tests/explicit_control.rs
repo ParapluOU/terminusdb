@@ -1,9 +1,10 @@
 use terminus_store::store::sync::open_sync_memory_store;
 use terminus_store::ValueTriple;
 use terminusdb_query_proof::{compile, prove};
+use terminusdb_woql2::misc::Count;
 use terminusdb_woql2::query::{And, Query};
 use terminusdb_woql2::triple::Triple;
-use terminusdb_woql2::value::{NodeValue, Value};
+use terminusdb_woql2::value::{DataValue, NodeValue, Value};
 
 fn iri(value: &str) -> String {
     format!("http://ex/{value}")
@@ -38,8 +39,12 @@ fn caller_explicitly_compiles_proves_and_selects_the_trusted_root() {
     }
     let (layer, _) = builder.commit_with_proof().unwrap();
 
-    let query = Query::And(And {
+    let bgp = Query::And(And {
         and: vec![triple("x", "knows", "y"), triple("y", "knows", "z")],
+    });
+    let query = Query::Count(Count {
+        query: Box::new(bgp),
+        count: DataValue::Variable("count".into()),
     });
 
     // These are deliberately separate calls: merely compiling or executing WOQL does
@@ -48,6 +53,8 @@ fn caller_explicitly_compiles_proves_and_selects_the_trusted_root() {
     let proved = prove(&layer, &compiled).unwrap();
     assert_eq!(compiled.schema, vec!["x", "y", "z"]);
     assert_eq!(proved.result_len, 2);
+    assert_eq!(proved.count_binding(&compiled), Some(("count", 2)));
+    assert_eq!(proved.projected_commitments(&compiled).count(), 0);
 
     let commitment = layer.proof_commitment().unwrap().unwrap();
     proved
