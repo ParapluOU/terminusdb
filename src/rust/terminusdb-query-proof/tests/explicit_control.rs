@@ -53,13 +53,23 @@ fn caller_explicitly_compiles_proves_and_selects_the_trusted_root() {
     let proved = prove(&layer, &compiled).unwrap();
     assert_eq!(compiled.schema, vec!["x", "y", "z"]);
     assert_eq!(proved.result_len, 2);
+    assert_eq!(proved.result_columns.len(), 3);
+    assert!(proved
+        .result_columns
+        .iter()
+        .all(|column| column.len() == proved.result_len));
     assert_eq!(proved.count_binding(&compiled), Some(("count", 2)));
     assert_eq!(proved.projected_commitments(&compiled).count(), 0);
+    assert_eq!(proved.projected_columns(&compiled).count(), 0);
 
     let commitment = layer.proof_commitment().unwrap().unwrap();
     proved
         .verify(&compiled, &commitment, commitment.state.commitment_root)
         .unwrap();
+
+    let mut omitted_row = proved.result_columns.clone();
+    omitted_row[0].pop();
+    assert!(proved.verify_columns(&omitted_row).is_err());
 
     let mut wrong_root = commitment.state.commitment_root;
     wrong_root[0] ^= 0xff;
