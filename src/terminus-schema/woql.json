@@ -5,7 +5,7 @@
     "@description":"This is the WOQL schema. It gives a complete specification of the syntax of the WOQL query language. This allows WOQL queries to be checked for syntactic correctness, helps to prevent errors and detect conflicts in merge of queries, and allows the storage and retrieval of queries so that queries can be associated with data products.",
     "@title":"WOQL schema"
   },
-  "@metadata": {"schema_version":"v1.0.3"},
+  "@metadata": {"schema_version":"v1.0.4"},
   "@schema":"http://terminusdb.com/schema/woql#",
   "@type":"@context",
   "xsd":"http://www.w3.org/2001/XMLSchema#"
@@ -624,8 +624,8 @@
     }
   },
   "@type":"Class",
-  "left":"DataValue",
-  "right":"DataValue"
+  "left":"Value",
+  "right":"Value"
 }
 {
   "@documentation": {
@@ -909,20 +909,18 @@
 }
 {
   "@documentation": {
-    "@comment":"A conditional which runs the then clause for every success from the test clause, otherwise runs the else clause.",
+    "@comment":"Runs the consequent for every success from the condition query and succeeds unchanged when it has no solutions.",
     "@properties": {
-      "else":"A query which runs whenever test fails.",
-      "test":"A query which will provide bindings for the then clause.",
-      "then":"A query which will run for every solution of test with associated bindings."
+      "consequent":"A query which runs for every solution of the condition query with its bindings.",
+      "query":"A query which provides bindings for the consequent."
     }
   },
-  "@id":"If",
+  "@id":"When",
   "@inherits":"Query",
   "@key": {"@type":"Random"},
   "@type":"Class",
-  "else":"Query",
-  "test":"Query",
-  "then":"Query"
+  "consequent":"Query",
+  "query":"Query"
 }
 {
   "@documentation": {
@@ -2004,7 +2002,7 @@
   "@key": {"@type":"Random"},
   "@metadata": {
     "https://terminusdb.com": {
-      "fields": ["template", "group_by", "value", "query" ],
+      "fields": ["template", "group_by", "grouped", "query" ],
       "mode": ["?", "?", "?", ":" ],
       "types": ["value", "template", "data_value", "query" ]
     }

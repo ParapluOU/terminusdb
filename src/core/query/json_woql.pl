@@ -294,6 +294,7 @@ json_type_to_woql_ast('Pin',JSON,WOQL,Path) :-
     json_to_woql_ast(Sub_Query,Sub_WOQL,[query
                                          |Path]),
     WOQL = pin(Sub_WOQL).
+json_type_to_woql_ast('True',_JSON,true,_Path).
 json_type_to_woql_ast('And',JSON,WOQL,Path) :-
     _{and : Query_List} :< JSON,
     index_list(Query_List, Indexes),
@@ -1798,6 +1799,19 @@ test(comment_without_query, []) :-
     atom_json_dict(JSON_Atom, JSON, []),
     json_woql(JSON, WOQL),
     WOQL = true.
+
+test(when_uses_query_and_consequent, []) :-
+    JSON_Atom = '{
+  "@type": "When",
+  "query": { "@type": "Comment" },
+  "consequent": { "@type": "Comment" }
+}',
+    atom_json_dict(JSON_Atom, JSON, []),
+    json_woql(JSON, WOQL),
+    WOQL = when(true, true).
+
+test(true_query, []) :-
+    json_woql(_{'@type': "True"}, true).
 
 :- end_tests(woql_jsonld).
 
