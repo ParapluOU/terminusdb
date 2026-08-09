@@ -6,7 +6,7 @@ use terminusdb_query_proof::{
     encode_envelope, encode_executed_envelope, prove,
 };
 use terminusdb_woql2::misc::Count;
-use terminusdb_woql2::query::{And, Not, Query};
+use terminusdb_woql2::query::{And, Not, Or, Query};
 use terminusdb_woql2::triple::Triple;
 use terminusdb_woql2::value::{DataValue, NodeValue, Value};
 
@@ -111,7 +111,7 @@ fn caller_explicitly_compiles_proves_and_selects_the_trusted_root() {
     // deserialization failures remain cheap and local.
     let query_json = bgp.to_woql_json().to_string();
     let executed_compiled = compile_json(&query_json).unwrap();
-    assert_eq!(executed_compiled.schema, vec!["x", "y", "z"]);
+    assert_eq!(executed_compiled.relation.schema, vec!["x", "y", "z"]);
     let query = Query::Count(Count {
         query: Box::new(bgp.clone()),
         count: DataValue::Variable("count".into()),
@@ -121,7 +121,7 @@ fn caller_explicitly_compiles_proves_and_selects_the_trusted_root() {
     // not start proving. The app/domain layer decides when `prove` is invoked.
     let compiled = compile(&query).unwrap();
     let proved = prove(&layer, &compiled).unwrap();
-    assert_eq!(compiled.schema, vec!["x", "y", "z"]);
+    assert_eq!(compiled.relation.schema, vec!["x", "y", "z"]);
     assert_eq!(proved.result_len, 2);
     assert_eq!(proved.result_columns.len(), 3);
     assert!(proved
@@ -292,6 +292,7 @@ fn native_boundary_round_trips_correlated_not_rows() {
         ("e", "p", "b"),
         ("b", "q", "a"),
         ("b", "q", "e"),
+        ("u", "r", "v"),
     ] {
         builder
             .add_value_triple(ValueTriple::new_node(
@@ -307,14 +308,17 @@ fn native_boundary_round_trips_correlated_not_rows() {
         and: vec![
             triple("x", "p", "y"),
             Query::Not(Not {
-                // Both outer variables are correlated, in reversed right-schema order.
-                query: Box::new(triple("y", "q", "x")),
+                // Both outer variables are correlated in reversed right-schema order;
+                // the negated child is itself an exact bag union.
+                query: Box::new(Query::Or(Or {
+                    or: vec![triple("y", "q", "x"), triple("y", "r", "x")],
+                })),
             }),
         ],
     });
     let query_json = query.to_woql_json().to_string();
     let compiled = compile_json(&query_json).unwrap();
-    assert!(compiled.anti_join.is_some());
+    assert!(compiled.relation.as_left_anti().is_some());
     let id = |name: &str| {
         commitment
             .node_value_catalog
@@ -368,10 +372,10 @@ fn native_boundary_round_trips_correlated_not_rows() {
     let global_json = global.to_woql_json().to_string();
     let global_compiled = compile_json(&global_json).unwrap();
     assert!(global_compiled
-        .anti_join
-        .as_ref()
+        .relation
+        .as_left_anti()
         .unwrap()
-        .key_pairs
+        .2
         .is_empty());
     let global_envelope = terminusdb_query_proof::prove_executed_and_encode(
         &layer,
