@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+default = []
+blitzar-cpu = ["terminus-store/blitzar-cpu", "terminusdb-woql2/blitzar-cpu"]
+blitzar-gpu = ["terminus-store/blitzar-gpu", "terminusdb-woql2/blitzar-gpu"]
+
 [dependencies]
 terminus-store = { version = "0.21.8", features = [] }
 terminusdb-woql2 = { path = "../../../../terminusdb-rs/crates/woql2", features = ["proof"] }

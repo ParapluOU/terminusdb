@@ -2,12 +2,14 @@
 
 use std::convert::TryInto;
 use std::io;
+use std::io::Write;
+use std::sync::Arc;
 
 use swipl::prelude::*;
 use terminusdb_query_proof::{
     decode_verify_executed_values_compact_envelope, decode_verify_executed_values_envelope,
     encode_verifier_commitment, migrate_legacy_chain, prove_executed_values_and_encode,
-    ExecutedResultValue, ProofHash,
+    ExecutedResultValue, ProofHash, QueryBlitzarConfig, QueryProver, QueryProverTier,
 };
 
 use crate::layer::WrappedLayer;
@@ -49,7 +51,48 @@ fn result_rows(rows: Vec<Vec<ProofResultValue>>) -> Vec<Vec<ExecutedResultValue>
         .collect()
 }
 
+fn prover_tier(text: &str) -> io::Result<QueryProverTier> {
+    match text {
+        "log20" => Ok(QueryProverTier::Log20),
+        "log22" => Ok(QueryProverTier::Log22),
+        "log24" => Ok(QueryProverTier::Log24),
+        _ => Err(invalid(
+            "prover tier must be exactly log20, log22, or log24",
+        )),
+    }
+}
+
+wrapped_arc_blob!("query_prover", pub WrappedQueryProver, QueryProver);
+
+impl WrappedArcBlobImpl for WrappedQueryProver {
+    fn write(_this: &QueryProver, stream: &mut PrologStream) -> io::Result<()> {
+        write!(stream, "<query_prover>")
+    }
+}
+
 predicates! {
+    /// Construct an explicit Arkworks CPU prover handle. The Arc-backed SWI blob owns
+    /// the prover and releases it safely when the final foreign reference is collected.
+    pub semidet fn query_proof_open_cpu_prover(_context, prover_term) {
+        prover_term.unify(&WrappedQueryProver(Arc::new(QueryProver::cpu())))
+    }
+
+    /// Construct an explicitly selected accelerated prover. Backend and tier atoms are
+    /// exact; unavailable compile-time features fail closed through a Prolog exception.
+    pub semidet fn query_proof_open_blitzar_prover(context, backend_term, tier_term, precomputed_term, prover_term) {
+        let backend: PrologText = backend_term.get_ex()?;
+        let tier_text: PrologText = tier_term.get_ex()?;
+        let precomputed: u64 = precomputed_term.get_ex()?;
+        let tier = context.try_or_die(prover_tier(&tier_text))?;
+        let config = QueryBlitzarConfig { num_precomputed_generators: precomputed };
+        let prover = match backend.as_ref() {
+            "cpu" => context.try_or_die(QueryProver::blitzar_cpu(tier, config).map_err(|error| invalid(error.to_string())))?,
+            "gpu" => context.try_or_die(QueryProver::blitzar_gpu(tier, config).map_err(|error| invalid(error.to_string())))?,
+            _ => return context.try_or_die(Err(invalid("Blitzar backend must be exactly cpu or gpu"))),
+        };
+        prover_term.unify(&WrappedQueryProver(Arc::new(prover)))
+    }
+
     /// Explicitly migrate the intrinsic proof chain ending at exactly `layer_id`
     /// in the caller-supplied Store. This does not resolve or follow a mutable graph
     /// head and is never called by open/query/startup paths.
@@ -89,6 +132,24 @@ predicates! {
         let root = context.try_or_die(expected_root(&root_text))?;
         let envelope = context.try_or_die(
             prove_executed_values_and_encode(&layer, &query_json, root, &variables, &rows)
+                .map_err(|error| invalid(error.to_string()))
+        )?;
+        envelope_term.unify(envelope.as_slice())
+    }
+
+    /// Prove with an explicitly caller-created foreign prover handle. This predicate
+    /// owns no global runtime and adds no scheduling or proof lifecycle policy.
+    pub semidet fn query_proof_run_envelope_with_prover(context, prover_term, layer_term, query_json_term, expected_root_term, variables_term, rows_term, envelope_term) {
+        let prover: WrappedQueryProver = prover_term.get_ex()?;
+        let layer: WrappedLayer = layer_term.get_ex()?;
+        let query_json: PrologText = query_json_term.get_ex()?;
+        let root_text: PrologText = expected_root_term.get_ex()?;
+        let variables: Vec<String> = variables_term.get_ex()?;
+        let rows = result_rows(rows_term.get_ex::<Vec<Vec<ProofResultValue>>>()?);
+        let root = context.try_or_die(expected_root(&root_text))?;
+        let envelope = context.try_or_die(
+            prover
+                .prove_executed_values_and_encode(&layer, &query_json, root, &variables, &rows)
                 .map_err(|error| invalid(error.to_string()))
         )?;
         envelope_term.unify(envelope.as_slice())
@@ -140,5 +201,25 @@ predicates! {
             .map(|_| ())
             .map_err(|error| invalid(error.to_string()))
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prover_tiers_are_exact() {
+        assert_eq!(prover_tier("log20").unwrap(), QueryProverTier::Log20);
+        assert_eq!(prover_tier("log22").unwrap(), QueryProverTier::Log22);
+        assert_eq!(prover_tier("log24").unwrap(), QueryProverTier::Log24);
+
+        for invalid in ["20", "Log20", "log21", "log24 ", ""] {
+            assert!(
+                prover_tier(invalid).is_err(),
+                "accepted invalid tier {:?}",
+                invalid
+            );
+        }
     }
 }

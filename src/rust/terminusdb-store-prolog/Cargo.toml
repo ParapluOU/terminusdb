@@ -10,6 +10,8 @@ publish = false
 [features]
 rollup_metadata_experimental = ["terminus-store/rollup_metadata_experimental"]
 query-proof = ["dep:terminusdb-query-proof"]
+blitzar-cpu = ["query-proof", "terminus-store/blitzar-cpu", "terminusdb-query-proof/blitzar-cpu"]
+blitzar-gpu = ["query-proof", "terminus-store/blitzar-gpu", "terminusdb-query-proof/blitzar-gpu"]
 
 [dependencies]
 swipl = {version="0.3.16", features=["serde"]}
@@ -31,6 +33,5 @@ tdb-succinct = "0.1.2"
 terminusdb-query-proof = { path = "../terminusdb-query-proof", optional = true }
 
 [dev-dependencies]
-# Same crate/version/features as the Proof-of-WOQL store fork, so ArkFr/ArkGT types
-# unify and the e2e test can independently reconstruct the expected result columns.
-dory-pcs = { version = "0.4.0", default-features = false, features = ["arkworks"] }
+# Use the same fork instance as Terminus Store so ArkFr/ArkGT are one type graph.
+dory-pcs = { path = "../../../../dory", default-features = false, features = ["arkworks"] }

@@ -8,6 +8,12 @@
 use std::io;
 
 use terminus_store::layer::Layer;
+#[cfg(any(
+    all(feature = "blitzar-cpu", not(feature = "blitzar-gpu")),
+    all(feature = "blitzar-gpu", not(feature = "blitzar-cpu"))
+))]
+use terminus_store::proof::argument::BlitzarRuntimeConfig;
+use terminus_store::proof::argument::{ProverSetupTier, StoreProverContext};
 use terminus_store::proof::commitment::VerifierCommitment;
 use terminus_store::store::sync::{SyncStore, SyncStoreLayer};
 use terminusdb_schema::FromTDBInstance;
@@ -27,6 +33,154 @@ pub enum ExecutionProofError {
     Proof(#[from] QueryProofError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+/// Exact Store setup tier selected by an application-owned accelerated prover.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueryProverTier {
+    Log20,
+    Log22,
+    Log24,
+}
+
+impl From<QueryProverTier> for ProverSetupTier {
+    fn from(value: QueryProverTier) -> Self {
+        match value {
+            QueryProverTier::Log20 => Self::Log20,
+            QueryProverTier::Log22 => Self::Log22,
+            QueryProverTier::Log24 => Self::Log24,
+        }
+    }
+}
+
+/// Explicit native preprocessing configuration. No default is chosen at proof time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueryBlitzarConfig {
+    pub num_precomputed_generators: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum QueryProverConfigError {
+    #[error("the requested `{0}` proving backend is not enabled in this build")]
+    FeatureUnavailable(&'static str),
+    #[error("Blitzar CPU and GPU features are mutually exclusive for QueryProver")]
+    ConflictingBackends,
+    #[error(transparent)]
+    Store(#[from] io::Error),
+}
+
+/// Application-domain owner of all proving arithmetic state.
+///
+/// Construction is the only place native initialization may occur. Methods perform
+/// proofs synchronously when called and contain no scheduler, cache, or lifecycle policy.
+pub struct QueryProver {
+    context: StoreProverContext<'static>,
+}
+
+impl QueryProver {
+    pub fn cpu() -> Self {
+        Self {
+            context: StoreProverContext::cpu(),
+        }
+    }
+
+    pub fn blitzar_cpu(
+        tier: QueryProverTier,
+        config: QueryBlitzarConfig,
+    ) -> Result<Self, QueryProverConfigError> {
+        #[cfg(all(feature = "blitzar-cpu", not(feature = "blitzar-gpu")))]
+        {
+            let runtime = StoreProverContext::initialize_blitzar(BlitzarRuntimeConfig {
+                num_precomputed_generators: config.num_precomputed_generators,
+            });
+            return Ok(Self {
+                context: StoreProverContext::blitzar(&runtime, tier.into())?,
+            });
+        }
+        #[cfg(all(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
+        {
+            let _ = (tier, config);
+            Err(QueryProverConfigError::ConflictingBackends)
+        }
+        #[cfg(not(feature = "blitzar-cpu"))]
+        {
+            let _ = (tier, config);
+            Err(QueryProverConfigError::FeatureUnavailable("blitzar-cpu"))
+        }
+    }
+
+    pub fn blitzar_gpu(
+        tier: QueryProverTier,
+        config: QueryBlitzarConfig,
+    ) -> Result<Self, QueryProverConfigError> {
+        #[cfg(all(feature = "blitzar-gpu", not(feature = "blitzar-cpu")))]
+        {
+            let runtime = StoreProverContext::initialize_blitzar(BlitzarRuntimeConfig {
+                num_precomputed_generators: config.num_precomputed_generators,
+            });
+            return Ok(Self {
+                context: StoreProverContext::blitzar(&runtime, tier.into())?,
+            });
+        }
+        #[cfg(all(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
+        {
+            let _ = (tier, config);
+            Err(QueryProverConfigError::ConflictingBackends)
+        }
+        #[cfg(not(feature = "blitzar-gpu"))]
+        {
+            let _ = (tier, config);
+            Err(QueryProverConfigError::FeatureUnavailable("blitzar-gpu"))
+        }
+    }
+
+    pub fn prove(
+        &self,
+        layer: &SyncStoreLayer,
+        compiled: &CompiledBgp,
+    ) -> Result<ProvedBgp, QueryProofError> {
+        compiled.prove_on_layer_with_context(&self.context, layer)
+    }
+
+    pub fn prove_executed_and_encode(
+        &self,
+        layer: &SyncStoreLayer,
+        query_json: &str,
+        expected_root: ProofHash,
+        variables: &[String],
+        rows: &[Vec<u64>],
+    ) -> Result<Vec<u8>, ExecutionProofError> {
+        let compiled = compile_json(query_json)?;
+        let proved = self.prove(layer, &compiled)?;
+        Ok(encode_executed_envelope(
+            layer,
+            &compiled,
+            &proved,
+            expected_root,
+            variables,
+            rows,
+        )?)
+    }
+
+    pub fn prove_executed_values_and_encode(
+        &self,
+        layer: &SyncStoreLayer,
+        query_json: &str,
+        expected_root: ProofHash,
+        variables: &[String],
+        rows: &[Vec<ExecutedResultValue>],
+    ) -> Result<Vec<u8>, ExecutionProofError> {
+        let compiled = compile_json(query_json)?;
+        let proved = self.prove(layer, &compiled)?;
+        Ok(encode_executed_values_envelope(
+            layer,
+            &compiled,
+            &proved,
+            expected_root,
+            variables,
+            rows,
+        )?)
+    }
 }
 
 /// Outcome of an explicitly requested migration of one immutable layer head.
@@ -130,7 +284,7 @@ pub fn compile_json(query_json: &str) -> Result<CompiledBgp, ExecutionProofError
 
 /// Generate a proof only when explicitly requested by the caller.
 pub fn prove(layer: &SyncStoreLayer, compiled: &CompiledBgp) -> Result<ProvedBgp, QueryProofError> {
-    compiled.prove_on_layer(layer)
+    QueryProver::cpu().prove(layer, compiled)
 }
 
 /// Serialize an explicitly generated proof/result after verifying it against the
@@ -195,16 +349,7 @@ pub fn prove_executed_and_encode(
     variables: &[String],
     rows: &[Vec<u64>],
 ) -> Result<Vec<u8>, ExecutionProofError> {
-    let compiled = compile_json(query_json)?;
-    let proved = prove(layer, &compiled)?;
-    Ok(encode_executed_envelope(
-        layer,
-        &compiled,
-        &proved,
-        expected_root,
-        variables,
-        rows,
-    )?)
+    QueryProver::cpu().prove_executed_and_encode(layer, query_json, expected_root, variables, rows)
 }
 
 /// Bind an already explicitly generated proof to ordinary executor rows and encode it.
@@ -267,16 +412,13 @@ pub fn prove_executed_values_and_encode(
     variables: &[String],
     rows: &[Vec<ExecutedResultValue>],
 ) -> Result<Vec<u8>, ExecutionProofError> {
-    let compiled = compile_json(query_json)?;
-    let proved = prove(layer, &compiled)?;
-    Ok(encode_executed_values_envelope(
+    QueryProver::cpu().prove_executed_values_and_encode(
         layer,
-        &compiled,
-        &proved,
+        query_json,
         expected_root,
         variables,
         rows,
-    )?)
+    )
 }
 
 /// Bind an already generated proof to typed executor values and encode it.

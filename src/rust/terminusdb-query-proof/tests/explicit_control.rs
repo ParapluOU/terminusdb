@@ -6,7 +6,8 @@ use terminus_store::{Layer, ValueTriple};
 use terminusdb_query_proof::{
     compile, compile_json, decode_and_verify_compact_envelope, decode_and_verify_envelope,
     decode_verify_executed_envelope, encode_envelope, encode_executed_envelope,
-    encode_verifier_commitment, prove,
+    encode_verifier_commitment, prove, QueryBlitzarConfig, QueryProver, QueryProverConfigError,
+    QueryProverTier,
 };
 use terminusdb_schema::{GraphType, XSDAnySimpleType};
 use terminusdb_woql2::compare::Gte;
@@ -38,6 +39,114 @@ fn predicate_triple(subject: &str, predicate: &str, object: &str) -> Query {
         object: Value::Variable(object.into()),
         graph: None,
     })
+}
+
+#[test]
+fn owned_cpu_prover_matches_the_cpu_convenience() {
+    let store = open_sync_memory_store();
+    let builder = store.create_base_layer().unwrap();
+    for (subject, object) in [("a", "b"), ("b", "c")] {
+        builder
+            .add_value_triple(ValueTriple::new_node(
+                &iri(subject),
+                &iri("knows"),
+                &iri(object),
+            ))
+            .unwrap();
+    }
+    let layer = builder.commit().unwrap();
+    let compiled = compile(&triple("subject", "knows", "object")).unwrap();
+    let root = layer.proof_commitment().unwrap().state.commitment_root;
+    let convenience = prove(&layer, &compiled).unwrap();
+    let owned = QueryProver::cpu().prove(&layer, &compiled).unwrap();
+    assert_eq!(
+        encode_envelope(&layer, &compiled, &convenience, root).unwrap(),
+        encode_envelope(&layer, &compiled, &owned, root).unwrap(),
+    );
+}
+
+#[cfg(not(feature = "blitzar-cpu"))]
+#[test]
+fn disabled_cpu_acceleration_fails_closed() {
+    let error = QueryProver::blitzar_cpu(
+        QueryProverTier::Log20,
+        QueryBlitzarConfig {
+            num_precomputed_generators: 0,
+        },
+    )
+    .err()
+    .unwrap();
+    assert!(matches!(
+        error,
+        QueryProverConfigError::FeatureUnavailable("blitzar-cpu")
+    ));
+}
+
+#[cfg(not(feature = "blitzar-gpu"))]
+#[test]
+fn disabled_gpu_acceleration_fails_closed() {
+    let error = QueryProver::blitzar_gpu(
+        QueryProverTier::Log20,
+        QueryBlitzarConfig {
+            num_precomputed_generators: 0,
+        },
+    )
+    .err()
+    .unwrap();
+    assert!(matches!(
+        error,
+        QueryProverConfigError::FeatureUnavailable("blitzar-gpu")
+    ));
+}
+
+#[cfg(all(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
+#[test]
+fn conflicting_acceleration_features_fail_closed() {
+    let config = QueryBlitzarConfig {
+        num_precomputed_generators: 0,
+    };
+    for result in [
+        QueryProver::blitzar_cpu(QueryProverTier::Log20, config),
+        QueryProver::blitzar_gpu(QueryProverTier::Log20, config),
+    ] {
+        assert!(matches!(
+            result,
+            Err(QueryProverConfigError::ConflictingBackends)
+        ));
+    }
+}
+
+#[cfg(all(feature = "blitzar-cpu", not(feature = "blitzar-gpu")))]
+#[test]
+fn owned_blitzar_cpu_prover_preserves_envelope_bytes() {
+    let store = open_sync_memory_store();
+    let builder = store.create_base_layer().unwrap();
+    for (subject, object) in [("a", "b"), ("b", "c")] {
+        builder
+            .add_value_triple(ValueTriple::new_node(
+                &iri(subject),
+                &iri("knows"),
+                &iri(object),
+            ))
+            .unwrap();
+    }
+    let layer = builder.commit().unwrap();
+    let compiled = compile(&triple("subject", "knows", "object")).unwrap();
+    let root = layer.proof_commitment().unwrap().state.commitment_root;
+    let cpu = QueryProver::cpu().prove(&layer, &compiled).unwrap();
+    let accelerated = QueryProver::blitzar_cpu(
+        QueryProverTier::Log20,
+        QueryBlitzarConfig {
+            num_precomputed_generators: 0,
+        },
+    )
+    .unwrap()
+    .prove(&layer, &compiled)
+    .unwrap();
+    assert_eq!(
+        encode_envelope(&layer, &compiled, &cpu, root).unwrap(),
+        encode_envelope(&layer, &compiled, &accelerated, root).unwrap(),
+    );
 }
 
 fn live_grouped_extrema(max: bool) -> Query {
