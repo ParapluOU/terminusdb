@@ -81,7 +81,9 @@ pub fn install(module: Option<&str>) {
     {
         query_proof::register_query_proof_migrate_layer_in_module(module);
         query_proof::register_query_proof_layer_root_in_module(module);
+        query_proof::register_query_proof_verifier_commitment_in_module(module);
         query_proof::register_query_proof_run_envelope_in_module(module);
         query_proof::register_query_proof_verify_envelope_in_module(module);
+        query_proof::register_query_proof_verify_compact_envelope_in_module(module);
     }
 }

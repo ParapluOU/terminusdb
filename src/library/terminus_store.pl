@@ -95,8 +95,10 @@
 :- if(current_prolog_flag(terminusdb_monolithic_module, true)).
 :- export(query_proof_migrate_layer/4).
 :- export(query_proof_layer_root/2).
+:- export(query_proof_verifier_commitment/2).
 :- export(query_proof_run_envelope/6).
 :- export(query_proof_verify_envelope/6).
+:- export(query_proof_verify_compact_envelope/6).
 :- endif.
 
 terminus_store_version('0.19.8').

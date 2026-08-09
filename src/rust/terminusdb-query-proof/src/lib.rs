@@ -8,10 +8,12 @@
 use std::io;
 
 use terminus_store::layer::Layer;
+use terminus_store::proof::commitment::VerifierCommitment;
 use terminus_store::store::sync::{SyncStore, SyncStoreLayer};
 use terminusdb_woql2::proof::{
-    decode_and_verify_envelope as decode_woql_envelope, plan_bgp, BgpPlanError, CompiledBgp,
-    ProvedBgp, QueryProofError, VerifiedBgpEnvelope,
+    decode_and_verify_envelope as decode_woql_envelope,
+    decode_verifier_commitment_and_verify_envelope as decode_compact_woql_envelope, plan_bgp,
+    BgpPlanError, CompiledBgp, ProvedBgp, QueryProofError, VerifiedBgpEnvelope,
 };
 use terminusdb_woql2::query::Query;
 
@@ -136,6 +138,29 @@ pub fn decode_and_verify_envelope(
         bytes,
         compiled,
         &commitment,
+        expected_root,
+    )?)
+}
+
+/// Derive the portable verifier-only projection of an explicitly selected layer.
+/// This chooses no persistence or transport policy.
+pub fn encode_verifier_commitment(layer: &SyncStoreLayer) -> Result<Vec<u8>, QueryProofError> {
+    let commitment = layer.proof_commitment()?;
+    Ok(commitment.verifier_commitment()?.encode()?)
+}
+
+/// Decode and verify using only a compact verifier artifact. The trusted root remains
+/// an independent required input and is never adopted from the decoded artifact.
+pub fn decode_and_verify_compact_envelope(
+    bytes: &[u8],
+    verifier_commitment_bytes: &[u8],
+    compiled: &CompiledBgp,
+    expected_root: ProofHash,
+) -> Result<VerifiedBgpEnvelope, QueryProofError> {
+    Ok(decode_compact_woql_envelope(
+        bytes,
+        compiled,
+        verifier_commitment_bytes,
         expected_root,
     )?)
 }
@@ -265,6 +290,45 @@ pub fn decode_verify_executed_values_envelope(
     let compiled = compile_json(query_json)?;
     let verified = decode_and_verify_envelope(bytes, layer, &compiled, expected_root)?;
     let commitment = layer.proof_commitment()?;
+    if compiled.count_variable.is_some() {
+        let rows = scalar_rows(rows)?;
+        verified.proved.verify_executed_rows(
+            &compiled,
+            &commitment,
+            expected_root,
+            variables,
+            &rows,
+        )?;
+    } else {
+        verified.proved.verify_executed_values(
+            &compiled,
+            &commitment,
+            expected_root,
+            variables,
+            rows,
+        )?;
+    }
+    Ok(verified)
+}
+
+/// Compact-artifact variant of [`decode_verify_executed_values_envelope`]. It binds
+/// ordinary executor values without loading a native Store layer or witness tables.
+pub fn decode_verify_executed_values_compact_envelope(
+    bytes: &[u8],
+    verifier_commitment_bytes: &[u8],
+    query_json: &str,
+    expected_root: ProofHash,
+    variables: &[String],
+    rows: &[Vec<ExecutedResultValue>],
+) -> Result<VerifiedBgpEnvelope, ExecutionProofError> {
+    let compiled = compile_json(query_json)?;
+    let verified = decode_and_verify_compact_envelope(
+        bytes,
+        verifier_commitment_bytes,
+        &compiled,
+        expected_root,
+    )?;
+    let commitment = VerifierCommitment::decode(verifier_commitment_bytes)?;
     if compiled.count_variable.is_some() {
         let rows = scalar_rows(rows)?;
         verified.proved.verify_executed_rows(

@@ -5,7 +5,8 @@ use std::io;
 
 use swipl::prelude::*;
 use terminusdb_query_proof::{
-    decode_verify_executed_values_envelope, migrate_legacy_chain, prove_executed_values_and_encode,
+    decode_verify_executed_values_compact_envelope, decode_verify_executed_values_envelope,
+    encode_verifier_commitment, migrate_legacy_chain, prove_executed_values_and_encode,
     ExecutedResultValue, ProofHash,
 };
 
@@ -68,6 +69,15 @@ predicates! {
         root_term.unify(hex::encode(commitment.state.commitment_root))
     }
 
+    /// Derive a portable verifier-only artifact for an explicitly selected layer.
+    pub semidet fn query_proof_verifier_commitment(context, layer_term, artifact_term) {
+        let layer: WrappedLayer = layer_term.get_ex()?;
+        let artifact = context.try_or_die(
+            encode_verifier_commitment(&layer).map_err(|error| invalid(error.to_string()))
+        )?;
+        artifact_term.unify(artifact.as_slice())
+    }
+
     /// Explicitly compile/prove/encode after the ordinary Prolog executor has returned
     /// `rows` as Store IDs in `variables` order.
     pub semidet fn query_proof_run_envelope(context, layer_term, query_json_term, expected_root_term, variables_term, rows_term, envelope_term) {
@@ -98,6 +108,30 @@ predicates! {
             decode_verify_executed_values_envelope(
                 &envelope,
                 &layer,
+                &query_json,
+                root,
+                &variables,
+                &rows,
+            )
+            .map(|_| ())
+            .map_err(|error| invalid(error.to_string()))
+        )
+    }
+
+
+    /// Decode/verify and bind executor rows using only a compact verifier artifact.
+    pub semidet fn query_proof_verify_compact_envelope(context, artifact_term, query_json_term, expected_root_term, variables_term, rows_term, envelope_term) {
+        let artifact: Vec<u8> = artifact_term.get_ex()?;
+        let query_json: PrologText = query_json_term.get_ex()?;
+        let root_text: PrologText = expected_root_term.get_ex()?;
+        let variables: Vec<String> = variables_term.get_ex()?;
+        let rows = result_rows(rows_term.get_ex::<Vec<Vec<ProofResultValue>>>()?);
+        let envelope: Vec<u8> = envelope_term.get_ex()?;
+        let root = context.try_or_die(expected_root(&root_text))?;
+        context.try_or_die(
+            decode_verify_executed_values_compact_envelope(
+                &envelope,
+                &artifact,
                 &query_json,
                 root,
                 &variables,

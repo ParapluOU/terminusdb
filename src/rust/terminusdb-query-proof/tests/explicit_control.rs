@@ -3,8 +3,9 @@ use terminus_store::proof::CanonicalObject;
 use terminus_store::store::sync::{open_sync_archive_store, open_sync_memory_store};
 use terminus_store::{Layer, ValueTriple};
 use terminusdb_query_proof::{
-    compile, compile_json, decode_and_verify_envelope, decode_verify_executed_envelope,
-    encode_envelope, encode_executed_envelope, prove,
+    compile, compile_json, decode_and_verify_compact_envelope, decode_and_verify_envelope,
+    decode_verify_executed_envelope, encode_envelope, encode_executed_envelope,
+    encode_verifier_commitment, prove,
 };
 use terminusdb_woql2::control::WoqlOptional;
 use terminusdb_woql2::misc::Count;
@@ -32,6 +33,26 @@ fn predicate_triple(subject: &str, predicate: &str, object: &str) -> Query {
         object: Value::Variable(object.into()),
         graph: None,
     })
+}
+
+#[test]
+fn compact_verifier_artifact_is_smaller_than_pf4_for_materialized_data() {
+    let store = open_sync_memory_store();
+    let builder = store.create_base_layer().unwrap();
+    for index in 0..64 {
+        builder
+            .add_value_triple(ValueTriple::new_node(
+                &iri(&format!("s{index}")),
+                &iri("p"),
+                &iri(&format!("o{index}")),
+            ))
+            .unwrap();
+    }
+    let layer = builder.commit().unwrap();
+    let full = layer.proof_commitment().unwrap().encode().unwrap();
+    let compact = encode_verifier_commitment(&layer).unwrap();
+    eprintln!("PF4={} compact={}", full.len(), compact.len());
+    assert!(compact.len() < full.len());
 }
 
 #[test]
@@ -437,6 +458,7 @@ fn recursive_optional_then_not_envelope_survives_archive_reopen() {
     let proved = prove(&layer, &compiled).unwrap();
     assert_eq!(proved.result_len, 1);
     let envelope = encode_envelope(&layer, &compiled, &proved, trusted_root).unwrap();
+    let verifier_commitment = encode_verifier_commitment(&layer).unwrap();
 
     drop(proved);
     drop(commitment);
@@ -452,4 +474,27 @@ fn recursive_optional_then_not_envelope_survives_archive_reopen() {
         verified.result_values.as_ref().unwrap()[2][0],
         CanonicalResultValue::Null
     ));
+    let compact_verified = decode_and_verify_compact_envelope(
+        &envelope,
+        &verifier_commitment,
+        &compiled,
+        trusted_root,
+    )
+    .unwrap();
+    assert_eq!(compact_verified.proved.result_len, 1);
+    let mut wrong_root = trusted_root;
+    wrong_root[0] ^= 1;
+    assert!(decode_and_verify_compact_envelope(
+        &envelope,
+        &verifier_commitment,
+        &compiled,
+        wrong_root,
+    )
+    .is_err());
+    let mut tampered = verifier_commitment;
+    let last = tampered.len() - 1;
+    tampered[last] ^= 1;
+    assert!(
+        decode_and_verify_compact_envelope(&envelope, &tampered, &compiled, trusted_root).is_err()
+    );
 }

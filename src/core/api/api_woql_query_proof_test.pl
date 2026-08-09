@@ -12,6 +12,8 @@
 :- use_module(library(yall)).
 :- use_module(library(terminus_store), [open_archive_store/3,
                                        query_proof_layer_root/2,
+                                       query_proof_verifier_commitment/2,
+                                       query_proof_verify_compact_envelope/6,
                                        query_proof_verify_envelope/6]).
 
 query_proof_release_tests_enabled :-
@@ -624,6 +626,9 @@ test(running_node_multilayer_archive_envelope,
           atom_json_dict(Query_Atom, Query, []),
           query_proof_verify_envelope(Layer, Query_Atom, Root,
                                       Variables, Rows, Envelope),
+          query_proof_verifier_commitment(Layer, Verifier_Commitment),
+          query_proof_verify_compact_envelope(Verifier_Commitment, Query_Atom, Root,
+                                              Variables, Rows, Envelope),
           query_proof_test_stage(reopen_verify_complete),
           query_proof_test_corrupt_envelope(Envelope, Corrupt),
           query_proof_test_require(
