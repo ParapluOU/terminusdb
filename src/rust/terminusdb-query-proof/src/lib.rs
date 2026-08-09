@@ -10,6 +10,7 @@ use std::io;
 use terminus_store::layer::Layer;
 use terminus_store::proof::commitment::VerifierCommitment;
 use terminus_store::store::sync::{SyncStore, SyncStoreLayer};
+use terminusdb_schema::FromTDBInstance;
 use terminusdb_woql2::proof::{
     decode_and_verify_envelope as decode_woql_envelope,
     decode_verifier_commitment_and_verify_envelope as decode_compact_woql_envelope, plan_bgp,
@@ -104,7 +105,26 @@ pub fn compile(query: &Query) -> Result<CompiledBgp, BgpPlanError> {
 
 /// Parse and compile the normalized WOQL JSON used by the running node.
 pub fn compile_json(query_json: &str) -> Result<CompiledBgp, ExecutionProofError> {
-    let query: Query = serde_json::from_str(query_json)?;
+    // Use woql2/schema's canonical JSON-LD decoder. `serde_json::from_str<Query>`
+    // happens to delegate through generated serde glue today, but it is not the
+    // domain decoding API and obscures typed-value errors behind serde context.
+    let json: serde_json::Value = serde_json::from_str(query_json)?;
+    let supplied = json.clone();
+    let query = Query::from_json(json).map_err(|error| {
+        serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    })?;
+    // The generated domain decoder intentionally builds model instances and may
+    // otherwise ignore an unknown property. This trust boundary accepts only the
+    // canonical normalized WOQL representation: round-tripping must reproduce the
+    // exact JSON value, which rejects unknown/misspelled fields without a second
+    // hand-written query decoder.
+    if query.to_woql_json() != supplied {
+        return Err(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "WOQL JSON is not the canonical normalized query representation",
+        ))
+        .into());
+    }
     Ok(compile(&query).map_err(QueryProofError::from)?)
 }
 

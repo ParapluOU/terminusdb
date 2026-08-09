@@ -7,8 +7,10 @@ publish = false
 [dependencies]
 terminus-store = { version = "0.21.8", features = [] }
 terminusdb-woql2 = { path = "../../../../terminusdb-rs/crates/woql2", features = ["proof"] }
+terminusdb-schema = { path = "../../../../terminusdb-rs/crates/schema" }
 serde_json = "1.0"
 thiserror = "2"
 
 [dev-dependencies]
 tempfile = "3"
+tdb-succinct = "0.1.2"

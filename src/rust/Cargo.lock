@@ -3501,8 +3501,10 @@ name = "terminusdb-query-proof"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "tdb-succinct",
  "tempfile",
  "terminus-store",
+ "terminusdb-schema",
  "terminusdb-woql2",
  "thiserror 2.0.19",
 ]

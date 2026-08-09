@@ -1,3 +1,4 @@
+use tdb_succinct::TdbDataType;
 use terminus_store::proof::query::CanonicalResultValue;
 use terminus_store::proof::CanonicalObject;
 use terminus_store::store::sync::{open_sync_archive_store, open_sync_memory_store};
@@ -7,10 +8,14 @@ use terminusdb_query_proof::{
     decode_verify_executed_envelope, encode_envelope, encode_executed_envelope,
     encode_verifier_commitment, prove,
 };
+use terminusdb_schema::{GraphType, XSDAnySimpleType};
+use terminusdb_woql2::compare::Gte;
+use terminusdb_woql2::control::Select;
 use terminusdb_woql2::control::WoqlOptional;
-use terminusdb_woql2::misc::Count;
+use terminusdb_woql2::misc::{Count, RangeMax, RangeMin};
+use terminusdb_woql2::order::GroupBy;
 use terminusdb_woql2::query::{And, Not, Or, Query};
-use terminusdb_woql2::triple::Triple;
+use terminusdb_woql2::triple::{Data, Triple};
 use terminusdb_woql2::value::{DataValue, NodeValue, Value};
 
 fn iri(value: &str) -> String {
@@ -33,6 +38,143 @@ fn predicate_triple(subject: &str, predicate: &str, object: &str) -> Query {
         object: Value::Variable(object.into()),
         graph: None,
     })
+}
+
+fn live_grouped_extrema(max: bool) -> Query {
+    let child = Query::And(And {
+        and: vec![
+            Query::Data(Data {
+                subject: NodeValue::Variable("category".into()),
+                predicate: NodeValue::Node(iri("score")),
+                object: DataValue::Variable("score".into()),
+                graph: GraphType::Instance,
+            }),
+            Query::Gte(Gte {
+                left: DataValue::Variable("score".into()),
+                right: DataValue::Data(XSDAnySimpleType::UnsignedInt(0)),
+            }),
+        ],
+    });
+    let group = Query::GroupBy(GroupBy {
+        template: Value::Variable("score".into()),
+        group_by: vec!["category".into()],
+        grouped_value: Value::Variable("scores".into()),
+        query: Box::new(child),
+    });
+    let range = if max {
+        Query::RangeMax(RangeMax {
+            list: DataValue::Variable("scores".into()),
+            result: DataValue::Variable("extremum".into()),
+        })
+    } else {
+        Query::RangeMin(RangeMin {
+            list: DataValue::Variable("scores".into()),
+            result: DataValue::Variable("extremum".into()),
+        })
+    };
+    Query::Select(Select {
+        variables: vec!["category".into(), "extremum".into()],
+        query: Box::new(Query::And(And {
+            and: vec![group, range],
+        })),
+    })
+}
+
+#[test]
+fn canonical_json_grouped_extrema_proves_and_crosses_execution_boundary() {
+    let existing = triple("s", "p", "o").to_woql_json().to_string();
+    assert_eq!(compile_json(&existing).unwrap().relation.schema, ["s", "o"]);
+    for max in [false, true] {
+        let query = live_grouped_extrema(max);
+        let compiled = compile(&query).unwrap();
+        assert_eq!(compiled.relation.schema, ["category", "extremum"]);
+        let json = query.to_woql_json().to_string();
+        assert_eq!(
+            compile_json(&json).unwrap().relation.schema,
+            compiled.relation.schema
+        );
+
+        let mut malformed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        malformed["query"]["and"][1]["@type"] = serde_json::json!("RangeMedian");
+        assert!(compile_json(&malformed.to_string()).is_err());
+        let mut missing: serde_json::Value = serde_json::from_str(&json).unwrap();
+        missing["query"]["and"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("result");
+        assert!(compile_json(&missing.to_string()).is_err());
+        let mut unknown: serde_json::Value = serde_json::from_str(&json).unwrap();
+        unknown["query"]["and"][1]["forged"] = serde_json::json!(true);
+        assert!(compile_json(&unknown.to_string()).is_err());
+    }
+
+    let store = open_sync_memory_store();
+    let builder = store.create_base_layer().unwrap();
+    for (category, score) in [("c1", 30u32), ("c1", 10), ("c2", 5), ("c2", 20)] {
+        builder
+            .add_value_triple(ValueTriple::new_value(
+                &iri(category),
+                &iri("score"),
+                u32::make_entry(&score),
+            ))
+            .unwrap();
+    }
+    let layer = builder.commit().unwrap();
+    let commitment = layer.proof_commitment().unwrap();
+    let query_json = live_grouped_extrema(false).to_woql_json().to_string();
+    let id_node = |name: &str| {
+        commitment
+            .node_value_catalog
+            .iter()
+            .find(|r| r.triple.object == CanonicalObject::Node(iri(name).into_bytes()))
+            .unwrap()
+            .object_id
+    };
+    let id_u32 = |value: u32| {
+        commitment
+            .node_value_catalog
+            .iter()
+            .find(|r| match &r.triple.object {
+                CanonicalObject::Value { datatype, lexical } => {
+                    *datatype == terminus_store::proof::CanonicalDatatype::UInt32
+                        && lexical.as_slice() == value.to_be_bytes()
+                }
+                _ => false,
+            })
+            .unwrap()
+            .object_id
+    };
+    let variables = vec!["category".into(), "extremum".into()];
+    let rows = vec![
+        vec![id_node("c2"), id_u32(5)],
+        vec![id_node("c1"), id_u32(10)],
+    ];
+    let envelope = terminusdb_query_proof::prove_executed_and_encode(
+        &layer,
+        &query_json,
+        commitment.state.commitment_root,
+        &variables,
+        &rows,
+    )
+    .unwrap();
+    decode_verify_executed_envelope(
+        &envelope,
+        &layer,
+        &query_json,
+        commitment.state.commitment_root,
+        &variables,
+        &rows,
+    )
+    .unwrap();
+    let compact = encode_verifier_commitment(&layer).unwrap();
+    let compiled = compile_json(&query_json).unwrap();
+    decode_and_verify_compact_envelope(
+        &envelope,
+        &compact,
+        &compiled,
+        commitment.state.commitment_root,
+    )
+    .unwrap();
 }
 
 #[test]

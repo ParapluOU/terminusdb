@@ -113,6 +113,14 @@ work. The suite additionally runs a normal `woql_query_json/9` `Limit` query;
 `Limit` is intentionally unsupported by the proof planner, so its success
 guards against accidental proof compilation on the ordinary path.
 
+The bounded scalar `GroupBy` followed immediately by `RangeMin`/`RangeMax` is
+covered end-to-end in `terminusdb-rs` (recursive child, outer `Select`, count,
+portable envelope, and compact verifier artifact). The running-node bridge uses
+woql2/schema's canonical `Query::from_json` decoder after parsing JSON, rather
+than serde-derived `Query` decoding. Its focused regression round-trips both
+normalized extrema shapes, rejects unknown tags and missing/unknown fields, and
+runs `RangeMin` through the executed-row envelope and compact verifier artifact.
+
 The integration fixture does not manufacture a legacy PF3/v3 sidecar. There is
 deliberately no production v3 writer, and duplicating the private legacy codec
 here would weaken the migration boundary. Store's focused migration tests cover
