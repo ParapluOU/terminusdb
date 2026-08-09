@@ -23,6 +23,67 @@ fn triple(subject: &str, predicate: &str, object: &str) -> Query {
     })
 }
 
+fn predicate_triple(subject: &str, predicate: &str, object: &str) -> Query {
+    Query::Triple(Triple {
+        subject: NodeValue::Variable(subject.into()),
+        predicate: NodeValue::Variable(predicate.into()),
+        object: Value::Variable(object.into()),
+        graph: None,
+    })
+}
+
+#[test]
+fn native_boundary_accepts_predicate_ids_and_rejects_dropped_rows() {
+    let store = open_sync_memory_store();
+    let builder = store.create_base_layer().unwrap();
+    for (subject, predicate, object) in [("a", "knows", "b"), ("c", "likes", "d")] {
+        builder
+            .add_value_triple(ValueTriple::new_node(
+                &iri(subject),
+                &iri(predicate),
+                &iri(object),
+            ))
+            .unwrap();
+    }
+    let layer = builder.commit().unwrap();
+    let commitment = layer.proof_commitment().unwrap();
+    let query_json = predicate_triple("s", "p", "o").to_woql_json().to_string();
+    let variables = vec!["s".into(), "p".into(), "o".into()];
+    let rows: Vec<Vec<u64>> = commitment
+        .materialized
+        .iter()
+        .map(|record| vec![record.subject_id, record.predicate_id, record.object_id])
+        .collect();
+
+    let envelope = terminusdb_query_proof::prove_executed_and_encode(
+        &layer,
+        &query_json,
+        commitment.state.commitment_root,
+        &variables,
+        &rows,
+    )
+    .unwrap();
+    decode_verify_executed_envelope(
+        &envelope,
+        &layer,
+        &query_json,
+        commitment.state.commitment_root,
+        &variables,
+        &rows,
+    )
+    .unwrap();
+
+    assert!(decode_verify_executed_envelope(
+        &envelope,
+        &layer,
+        &query_json,
+        commitment.state.commitment_root,
+        &variables,
+        &rows[..1],
+    )
+    .is_err());
+}
+
 #[test]
 fn caller_explicitly_compiles_proves_and_selects_the_trusted_root() {
     let store = open_sync_memory_store();

@@ -22,6 +22,7 @@
 
 :- use_module(library(json)).
 :- use_module(library(terminus_store), [object_id/3,
+                                       predicate_id/3,
                                        query_proof_run_envelope/6]).
 
 % Load document/json module to register json:json_write_hook/4 for rational precision
@@ -99,24 +100,50 @@ proof_binding_row(some(Query_JSON, _, _), Context, _Transaction, [Count]) :-
     member(Record, Context.bindings),
     Record.var_name = Count_Name,
     query_proof_count_value(Record.woql_var, Count).
-proof_binding_row(some(_, _, _), Context, Transaction, Row) :-
+proof_binding_row(some(Query_JSON, _, _), Context, Transaction, Row) :-
     context_variable_names(Context, Names),
     [Instance_Object] = Transaction.instance_objects,
     Layer = Instance_Object.read,
-    maplist({Context,Layer}/[Name,Id]>>proof_binding_id(Context, Layer, Name, Id), Names, Row).
+    maplist({Query_JSON,Context,Layer}/[Name,Id]>>
+                proof_binding_id(Query_JSON, Context, Layer, Name, Id), Names, Row).
 
-proof_binding_id(Context, Layer, Name, Id) :-
+proof_binding_id(Query_JSON, Context, Layer, Name, Id) :-
     member(Record, Context.bindings),
     Record.var_name = Name,
     Value = Record.woql_var,
     (   var(Value)
     ->  throw(error(query_proof_unbound_result(Name), _))
+    ;   query_proof_predicate_variable(Query_JSON, Name)
+    ->  predicate_id(Layer, Value, Id)
     ;   Value = Lexical^^Datatype
     ->  object_id(Layer, value(Lexical, Datatype), Id)
     ;   Value = Lexical@Language
     ->  object_id(Layer, lang(Lexical, Language), Id)
     ;   object_id(Layer, node(Value), Id)
     ).
+
+% Capture predicate bindings in the Store's predicate-ID namespace. Rust independently
+% compiles the same query and rejects a name reused across predicate and S/O positions;
+% this traversal only selects the correct foreign dictionary lookup for accepted plans.
+query_proof_predicate_variable(Query, Name) :-
+    query_proof_json_type(Query, Type),
+    memberchk(Type, ['Triple','Link','Data']),
+    Predicate = Query.predicate,
+    get_dict(variable, Predicate, Raw_Name),
+    ( atom(Raw_Name)
+    -> Name = Raw_Name
+    ;  atom_string(Name, Raw_Name)
+    ).
+query_proof_predicate_variable(Query, Name) :-
+    query_proof_json_type(Query, Wrapper),
+    memberchk(Wrapper, ['Select','Using','From','Pin','Immediately','Count','Distinct','Not']),
+    query_proof_predicate_variable(Query.query, Name).
+query_proof_predicate_variable(Query, Name) :-
+    query_proof_json_type(Query, Junction),
+    memberchk(Junction, ['And','Or']),
+    ( Junction == 'And' -> Children = Query.and ; Children = Query.or ),
+    member(Child, Children),
+    query_proof_predicate_variable(Child, Name).
 
 query_proof_json_type(JSON, Type) :-
     get_dict('@type', JSON, Raw_Type),
