@@ -216,6 +216,27 @@ query_proof_test_ground_case(Path, Query, Root, Expected_Bindings,
     atom_json_dict(Query_Atom, Query, []),
     query_proof_verify_envelope(Layer, Query_Atom, Root, Variables, Rows, Envelope).
 
+query_proof_test_transparent_wrapper_query(Base_Query, Query) :-
+    Query = _{'@type':'From', graph:"instance",
+              query:_{'@type':'Pin',
+                      query:_{'@type':'Immediately', query:Base_Query}}}.
+
+query_proof_test_distinct_triple_query(
+    _{'@type':'Distinct', variables:["S","T"],
+      query:_{'@type':'Triple', subject:S, predicate:Tag, object:T}}) :-
+    query_proof_test_variable_node("S", S),
+    query_proof_test_variable_value("T", T),
+    query_proof_test_node("http://example.com/proof/tag", Tag).
+
+query_proof_test_verified_case(Path, Query, Root, Envelope, Variables, Rows) :-
+    query_proof_test_run(Path, Query, _Ordinary_Context, Ordinary_JSON),
+    query_proof_test_run_with_proof(Path, Query, Root, _Proof_Context,
+                                    Proof_JSON, Envelope),
+    query_proof_test_require(Ordinary_JSON = Proof_JSON, wrapper_json_changed),
+    query_proof_test_execution_rows(Path, Query, Layer, Variables, Rows),
+    atom_json_dict(Query_Atom, Query, []),
+    query_proof_verify_envelope(Layer, Query_Atom, Root, Variables, Rows, Envelope).
+
 query_proof_test_prepare_closed_archive(Dir, Payload) :-
     setup_unattached_store(Store-Dir),
     setup_call_cleanup(
@@ -277,10 +298,20 @@ query_proof_test_prepare_closed_archive(Dir, Payload) :-
                                        Absent_Envelope, Absent_Variables, Absent_Rows),
           query_proof_test_require(Absent_Rows = [], absent_ground_rows_changed),
           query_proof_test_stage(absent_ground_native_verify_complete),
+          query_proof_test_transparent_wrapper_query(Query, Wrapper_Query),
+          query_proof_test_verified_case(Path, Wrapper_Query, Root,
+                                         Wrapper_Envelope, Wrapper_Variables, Wrapper_Rows),
+          query_proof_test_stage(transparent_wrappers_native_verify_complete),
+          query_proof_test_distinct_triple_query(Distinct_Query),
+          query_proof_test_verified_case(Path, Distinct_Query, Root,
+                                         Distinct_Envelope, Distinct_Variables, Distinct_Rows),
+          query_proof_test_stage(distinct_triple_native_verify_complete),
           Payload = payload(Path,Query,Root,Envelope,Variables,Rows,
                             Count_Query,Count_Envelope,Count_Variables,Count_Rows,
                             Present_Ground,Present_Envelope,Present_Variables,Present_Rows,
-                            Absent_Ground,Absent_Envelope,Absent_Variables,Absent_Rows)
+                            Absent_Ground,Absent_Envelope,Absent_Variables,Absent_Rows,
+                            Wrapper_Query,Wrapper_Envelope,Wrapper_Variables,Wrapper_Rows,
+                            Distinct_Query,Distinct_Envelope,Distinct_Variables,Distinct_Rows)
         ),
         retract_local_triple_store(Store)),
     garbage_collect.
@@ -295,7 +326,9 @@ test(running_node_multilayer_archive_envelope,
     Payload = payload(Path,Query,Root,Envelope,Variables,Rows,
                       Count_Query,Count_Envelope,Count_Variables,Count_Rows,
                       Present_Ground,Present_Envelope,Present_Variables,Present_Rows,
-                      Absent_Ground,Absent_Envelope,Absent_Variables,Absent_Rows),
+                      Absent_Ground,Absent_Envelope,Absent_Variables,Absent_Rows,
+                      Wrapper_Query,Wrapper_Envelope,Wrapper_Variables,Wrapper_Rows,
+                      Distinct_Query,Distinct_Envelope,Distinct_Variables,Distinct_Rows),
     open_archive_store(Dir, 8, Reopened),
     setup_call_cleanup(
         set_local_triple_store(Reopened),
@@ -370,7 +403,19 @@ test(running_node_multilayer_archive_envelope,
                   query_proof_verify_envelope(Absent_Layer, Absent_Atom, Root,
                                               Absent_Variables, [[]], Absent_Envelope)),
               absent_ground_insertion_accepted),
-          query_proof_test_stage(absent_ground_reopen_verify_complete)
+          query_proof_test_stage(absent_ground_reopen_verify_complete),
+          query_proof_test_execution_rows(Path, Wrapper_Query, Wrapper_Layer,
+                                          Wrapper_Variables, Wrapper_Rows),
+          atom_json_dict(Wrapper_Atom, Wrapper_Query, []),
+          query_proof_verify_envelope(Wrapper_Layer, Wrapper_Atom, Root,
+                                      Wrapper_Variables, Wrapper_Rows, Wrapper_Envelope),
+          query_proof_test_stage(transparent_wrappers_reopen_verify_complete),
+          query_proof_test_execution_rows(Path, Distinct_Query, Distinct_Layer,
+                                          Distinct_Variables, Distinct_Rows),
+          atom_json_dict(Distinct_Atom, Distinct_Query, []),
+          query_proof_verify_envelope(Distinct_Layer, Distinct_Atom, Root,
+                                      Distinct_Variables, Distinct_Rows, Distinct_Envelope),
+          query_proof_test_stage(distinct_triple_reopen_verify_complete)
         ),
         retract_local_triple_store(Reopened)).
 
