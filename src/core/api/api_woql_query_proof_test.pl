@@ -58,10 +58,14 @@ query_proof_test_run_with_proof(Path, Query, Root, Context, JSON, Envelope) :-
 query_proof_test_node(Node, _{'@type':'NodeValue', node:Node}).
 query_proof_test_variable_node(Name, _{'@type':'NodeValue', variable:Name}).
 query_proof_test_variable_value(Name, _{'@type':'Value', variable:Name}).
+query_proof_test_variable_data(Name, _{'@type':'DataValue', variable:Name}).
 query_proof_test_node_value(Node, _{'@type':'Value', node:Node}).
 query_proof_test_typed_value(Type, Lexical,
                              _{'@type':'Value',
                                data:_{'@type':Type, '@value':Lexical}}).
+query_proof_test_typed_data(Type, Lexical,
+                            _{'@type':'DataValue',
+                              data:_{'@type':Type, '@value':Lexical}}).
 query_proof_test_lang_value(Language, Lexical,
                             _{'@type':'Value',
                               data:_{'@language':Language, '@value':Lexical}}).
@@ -362,6 +366,87 @@ query_proof_test_prepare_global_optional_archive(
                        get_dict('T', Binding, null),
                        get_dict('Z', Binding, null) )),
               global_optional_json_null_semantics_changed)
+        ),
+        retract_local_triple_store(Store)),
+    garbage_collect.
+
+query_proof_test_equals_query(
+    _{'@type':'Select', variables:["O","S"],
+      query:_{'@type':'And', and:[Triple,Equals]}}) :-
+    query_proof_test_variable_node("S", S_Node),
+    query_proof_test_variable_value("S", S_Value),
+    query_proof_test_variable_value("O", O),
+    query_proof_test_node("http://example.com/proof/p", P),
+    query_proof_test_node_value("http://example.com/proof/alice", Alice),
+    Triple = _{'@type':'Triple', subject:S_Node, predicate:P, object:O},
+    Equals = _{'@type':'Equals', left:S_Value, right:Alice}.
+
+query_proof_test_numeric_equals_queries(Variable_Constant, Variable_Variable) :-
+    query_proof_test_node("http://example.com/proof/typed", Typed),
+    query_proof_test_node("http://example.com/proof/p", P),
+    query_proof_test_node("http://example.com/proof/number2", Number2),
+    query_proof_test_variable_value("A", A_Value),
+    query_proof_test_variable_value("B", B_Value),
+    query_proof_test_variable_data("A", A_Data),
+    query_proof_test_variable_data("B", B_Data),
+    query_proof_test_typed_data('xsd:integer', 0, Integer_Zero),
+    query_proof_test_typed_data('xsd:unsignedInt', 0, UInt_Zero),
+    query_proof_test_typed_value('xsd:decimal', 42, Decimal_42),
+    A_Triple = _{'@type':'Triple', subject:Typed, predicate:P, object:A_Value},
+    B_Triple = _{'@type':'Triple', subject:Typed, predicate:Number2, object:B_Value},
+    A_Range = _{'@type':'Greater', left:A_Data, right:Integer_Zero},
+    B_Range = _{'@type':'Greater', left:B_Data, right:UInt_Zero},
+    Variable_Constant = _{'@type':'And',
+                          and:[A_Triple,A_Range,
+                               _{'@type':'Equals', left:A_Value, right:Decimal_42}]},
+    Variable_Variable = _{'@type':'And',
+                          and:[A_Triple,B_Triple,A_Range,B_Range,
+                               _{'@type':'Equals', left:A_Value, right:B_Value}]}.
+
+query_proof_test_prepare_equals_archive(
+    Dir, payload(Path,Query,Root,Envelope,Variables,Rows)) :-
+    setup_unattached_store(Store-Dir),
+    setup_call_cleanup(
+        set_local_triple_store(Store),
+        ( create_db_without_schema("admin", "proof_equals"),
+          Path = "admin/proof_equals",
+          query_proof_test_fixture_queries(Base, _Child, _Read),
+          query_proof_test_run(Path, Base, _Base_Context, _Base_JSON),
+          query_proof_test_node("http://example.com/proof/typed", Typed),
+          query_proof_test_node("http://example.com/proof/number2", Number2),
+          query_proof_test_typed_value('xsd:unsignedInt', 42, UInt_42),
+          query_proof_test_update('AddTriple', Typed, Number2, UInt_42, Add_UInt),
+          query_proof_test_run(Path, Add_UInt, _UInt_Context, _UInt_JSON),
+          query_proof_test_equals_query(Query),
+          query_proof_test_run(Path, Query, _Ordinary_Context, Ordinary_JSON),
+          query_proof_test_execution_rows(Path, Query, Layer, Variables, Rows),
+          query_proof_layer_root(Layer, Root),
+          query_proof_test_run_with_proof(Path, Query, Root, _Proof_Context,
+                                          Proof_JSON, Envelope),
+          query_proof_test_require(Ordinary_JSON = Proof_JSON,
+                                   equals_ordinary_json_changed),
+          query_proof_test_require(Variables = ["O","S"],
+                                   equals_variable_order_changed),
+          query_proof_test_require(Rows = [[_,_]], equals_rows_changed),
+          query_proof_test_numeric_equals_queries(Var_Constant, Var_Variable),
+          query_proof_test_run(Path, Var_Constant, _VC_Context, VC_JSON),
+          query_proof_test_require(VC_JSON.bindings \= [],
+                                   numeric_variable_constant_executor_changed),
+          query_proof_test_require(
+              query_proof_test_rejected(
+                  query_proof_test_run_with_proof(
+                      Path, Var_Constant, Root, _VC_Proof_Context,
+                      _VC_Proof_JSON, _VC_Envelope)),
+              numeric_variable_constant_proof_accepted),
+          query_proof_test_run(Path, Var_Variable, _VV_Context, VV_JSON),
+          query_proof_test_require(VV_JSON.bindings \= [],
+                                   numeric_variable_variable_executor_changed),
+          query_proof_test_require(
+              query_proof_test_rejected(
+                  query_proof_test_run_with_proof(
+                      Path, Var_Variable, Root, _VV_Proof_Context,
+                      _VV_Proof_JSON, _VV_Envelope)),
+              numeric_variable_variable_proof_accepted)
         ),
         retract_local_triple_store(Store)),
     garbage_collect.
@@ -873,6 +958,33 @@ test(global_optional_nullable_predicate_rows_survive_archive_reopen,
                                               Envelope)),
               global_optional_null_nonnullable_left_accepted),
           query_proof_test_stage(global_optional_archive_reopen_verify_complete)
+        ),
+        retract_local_triple_store(Reopened)).
+
+test(exact_equals_rows_survive_archive_reopen_and_coercion_rejects,
+     [ nondet,
+       setup(api_woql:query_proof_test_prepare_equals_archive(Dir, Payload)),
+       cleanup(delete_directory_and_contents(Dir))
+     ]) :-
+    Payload = payload(Path,Query,Root,Envelope,Variables,Rows),
+    open_archive_store(Dir, 8, Reopened),
+    setup_call_cleanup(
+        set_local_triple_store(Reopened),
+        ( query_proof_test_execution_rows(Path, Query, Layer,
+                                          Reopened_Variables, Reopened_Rows),
+          query_proof_test_require(Reopened_Variables = Variables,
+                                   equals_reopen_variables_changed),
+          query_proof_test_require(Reopened_Rows = Rows,
+                                   equals_reopen_rows_changed),
+          atom_json_dict(Query_Atom, Query, []),
+          query_proof_verify_envelope(Layer, Query_Atom, Root,
+                                      Variables, Rows, Envelope),
+          query_proof_test_require(
+              query_proof_test_rejected(
+                  query_proof_verify_envelope(Layer, Query_Atom, Root,
+                                              Variables, [], Envelope)),
+              equals_selected_row_omission_accepted),
+          query_proof_test_stage(equals_archive_reopen_verify_complete)
         ),
         retract_local_triple_store(Reopened)).
 

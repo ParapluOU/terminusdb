@@ -29,7 +29,7 @@ TERMINUSDB_QUERY_PROOF_RELEASE_TESTS=true \
   SWIPL_DIR="$DEPS/swipl-env/$TARGET/bin/"
 ```
 
-The suite is not marked concurrent and generates exactly fifteen proofs: one
+The suite is not marked concurrent and generates exactly sixteen proofs: one
 projected BGP, one live `Count` over the same relation, and present/absent
 standalone ground triples (including an object absent from the dictionary), plus
 a present/absent all-ground conjunction, a nested
@@ -52,6 +52,11 @@ The fifteenth is a global `Optional` whose authenticated right relation is empty
 it null-extends every left row across predicate and node/object namespaces, survives
 archive reopen, and rejects missing/extra rows, predicate-namespace substitution,
 and `null` in a nonnullable left column.
+The sixteenth is an exact, already-bound subject-node `Equals` filter. It matches the
+ordinary executor before and after archive reopen and rejects a dropped selected row.
+The same fixture confirms that Prolog accepts cross-datatype numeric equality for both
+variable/constant and variable/variable operands while proof compilation rejects those
+coercive forms before proof generation.
 On 2026-08-09 the clean
 release build took 215.47 seconds and the complete suite took 14.19 seconds
 (`user 13.79`, `sys 0.43`) on the development runner. CI should retain a
