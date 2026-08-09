@@ -5,7 +5,8 @@ use std::io;
 
 use swipl::prelude::*;
 use terminusdb_query_proof::{
-    decode_verify_executed_envelope, migrate_legacy_chain, prove_executed_and_encode, ProofHash,
+    decode_verify_executed_values_envelope, migrate_legacy_chain, prove_executed_values_and_encode,
+    ExecutedResultValue, ProofHash,
 };
 
 use crate::layer::WrappedLayer;
@@ -21,6 +22,30 @@ fn expected_root(text: &str) -> io::Result<ProofHash> {
     bytes
         .try_into()
         .map_err(|_| invalid("expected root must contain exactly 32 bytes"))
+}
+
+/// Foreign-wire value for an ordinary WOQL result cell. Positive integers are
+/// Store dictionary IDs and the atom `null` is the sole nullable representation.
+/// Whether that atom is legal in a particular column is decided later by the
+/// independently compiled Rust result descriptor.
+struct ProofResultValue(ExecutedResultValue);
+
+term_getable! {
+    (ProofResultValue, "positive Store ID or null", term) => {
+        if let Ok(id) = term.get::<u64>() {
+            return Some(ProofResultValue(ExecutedResultValue::Id(id)));
+        }
+        let is_null = term
+            .get_atom_name(|name| name == Some("null"))
+            .ok()?;
+        is_null.then_some(ProofResultValue(ExecutedResultValue::Null))
+    }
+}
+
+fn result_rows(rows: Vec<Vec<ProofResultValue>>) -> Vec<Vec<ExecutedResultValue>> {
+    rows.into_iter()
+        .map(|row| row.into_iter().map(|value| value.0).collect())
+        .collect()
 }
 
 predicates! {
@@ -50,10 +75,10 @@ predicates! {
         let query_json: PrologText = query_json_term.get_ex()?;
         let root_text: PrologText = expected_root_term.get_ex()?;
         let variables: Vec<String> = variables_term.get_ex()?;
-        let rows: Vec<Vec<u64>> = rows_term.get_ex()?;
+        let rows = result_rows(rows_term.get_ex::<Vec<Vec<ProofResultValue>>>()?);
         let root = context.try_or_die(expected_root(&root_text))?;
         let envelope = context.try_or_die(
-            prove_executed_and_encode(&layer, &query_json, root, &variables, &rows)
+            prove_executed_values_and_encode(&layer, &query_json, root, &variables, &rows)
                 .map_err(|error| invalid(error.to_string()))
         )?;
         envelope_term.unify(envelope.as_slice())
@@ -66,11 +91,11 @@ predicates! {
         let query_json: PrologText = query_json_term.get_ex()?;
         let root_text: PrologText = expected_root_term.get_ex()?;
         let variables: Vec<String> = variables_term.get_ex()?;
-        let rows: Vec<Vec<u64>> = rows_term.get_ex()?;
+        let rows = result_rows(rows_term.get_ex::<Vec<Vec<ProofResultValue>>>()?);
         let envelope: Vec<u8> = envelope_term.get_ex()?;
         let root = context.try_or_die(expected_root(&root_text))?;
         context.try_or_die(
-            decode_verify_executed_envelope(
+            decode_verify_executed_values_envelope(
                 &envelope,
                 &layer,
                 &query_json,

@@ -112,7 +112,10 @@ proof_binding_id(Query_JSON, Context, Layer, Name, Id) :-
     Record.var_name = Name,
     Value = Record.woql_var,
     (   var(Value)
-    ->  throw(error(query_proof_unbound_result(Name), _))
+    % `optional(Goal)` succeeds once with the right-only variables unbound when
+    % Goal has no match. The native boundary accepts this atom only where its
+    % independently compiled result descriptor marks the column nullable.
+    ->  Id = null
     ;   query_proof_predicate_variable(Query_JSON, Name)
     ->  predicate_id(Layer, Value, Id)
     ;   Value = Lexical^^Datatype

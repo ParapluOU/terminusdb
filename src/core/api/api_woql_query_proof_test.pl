@@ -258,6 +258,19 @@ query_proof_test_distinct_triple_query(
     query_proof_test_variable_value("T", T),
     query_proof_test_node("http://example.com/proof/tag", Tag).
 
+% A correlated Optional with both matched and unmatched left rows. The deleted
+% `removed/p/gone` triple leaves `removed/tag/t5` as the one null-extended row.
+query_proof_test_optional_query(
+    _{'@type':'Select', variables:["O","S","T"],
+      query:_{'@type':'And', and:[Left,_{'@type':'Optional', query:Right}]}}) :-
+    query_proof_test_variable_node("S", S),
+    query_proof_test_variable_value("O", O),
+    query_proof_test_variable_value("T", T),
+    query_proof_test_node("http://example.com/proof/p", P),
+    query_proof_test_node("http://example.com/proof/tag", Tag),
+    Left = _{'@type':'Triple', subject:S, predicate:Tag, object:T},
+    Right = _{'@type':'Triple', subject:S, predicate:P, object:O}.
+
 query_proof_test_verified_case(Path, Query, Root, Envelope, Variables, Rows) :-
     query_proof_test_run(Path, Query, _Ordinary_Context, Ordinary_JSON),
     query_proof_test_run_with_proof(Path, Query, Root, _Proof_Context,
@@ -266,6 +279,39 @@ query_proof_test_verified_case(Path, Query, Root, Envelope, Variables, Rows) :-
     query_proof_test_execution_rows(Path, Query, Layer, Variables, Rows),
     atom_json_dict(Query_Atom, Query, []),
     query_proof_verify_envelope(Layer, Query_Atom, Root, Variables, Rows, Envelope).
+
+query_proof_test_prepare_optional_archive(Dir,
+                                          payload(Path,Query,Root,Envelope,
+                                                  Variables,Rows)) :-
+    setup_unattached_store(Store-Dir),
+    setup_call_cleanup(
+        set_local_triple_store(Store),
+        ( create_db_without_schema("admin", "proof_optional"),
+          Path = "admin/proof_optional",
+          query_proof_test_fixture_queries(Base, Child, _Read),
+          query_proof_test_run(Path, Base, _Base_Context, _Base_JSON),
+          query_proof_test_run(Path, Child, _Child_Context, _Child_JSON),
+          query_proof_test_optional_query(Query),
+          query_proof_test_run(Path, Query, _Ordinary_Context, Ordinary_JSON),
+          query_proof_test_execution_rows(Path, Query, Layer, Variables, Rows),
+          query_proof_layer_root(Layer, Root),
+          query_proof_test_run_with_proof(Path, Query, Root, _Proof_Context,
+                                          Proof_JSON, Envelope),
+          query_proof_test_require(Ordinary_JSON = Proof_JSON,
+                                   optional_ordinary_json_changed),
+          query_proof_test_require(Variables = ["O","S","T"],
+                                   optional_variable_order_changed),
+          query_proof_test_require(
+              ( member([null,_,_], Rows),
+                member([Matched_O,_,_], Rows), integer(Matched_O) ),
+              optional_typed_rows_changed),
+          query_proof_test_require(
+              ( member(Unbound_Binding, Proof_JSON.bindings),
+                \+ get_dict('O', Unbound_Binding, _) ),
+              optional_json_unbound_semantics_changed)
+        ),
+        retract_local_triple_store(Store)),
+    garbage_collect.
 
 query_proof_test_prepare_closed_archive(Dir, Payload) :-
     setup_unattached_store(Store-Dir),
@@ -674,6 +720,58 @@ test(running_node_multilayer_archive_envelope,
           query_proof_verify_envelope(Distinct_Layer, Distinct_Atom, Root,
                                       Distinct_Variables, Distinct_Rows, Distinct_Envelope),
           query_proof_test_stage(distinct_triple_reopen_verify_complete)
+        ),
+        retract_local_triple_store(Reopened)).
+
+test(correlated_optional_nullable_rows_survive_archive_reopen,
+     [ setup(api_woql:query_proof_test_prepare_optional_archive(Dir, Payload)),
+       cleanup(delete_directory_and_contents(Dir))
+     ]) :-
+    Payload = payload(Path,Query,Root,Envelope,Variables,Rows),
+    open_archive_store(Dir, 8, Reopened),
+    setup_call_cleanup(
+        set_local_triple_store(Reopened),
+        ( query_proof_test_execution_rows(Path, Query, Layer,
+                                          Reopened_Variables, Reopened_Rows),
+          query_proof_test_require(Reopened_Variables = Variables,
+                                   optional_reopen_variables_changed),
+          query_proof_test_require(Reopened_Rows = Rows,
+                                   optional_reopen_rows_changed),
+          atom_json_dict(Query_Atom, Query, []),
+          query_proof_verify_envelope(Layer, Query_Atom, Root,
+                                      Variables, Rows, Envelope),
+          Unmatched = [null,Shared,T],
+          member(Unmatched, Rows),
+          member([Matched_O,_,_], Rows),
+          integer(Matched_O),
+          select(Unmatched, Rows, Missing_Unmatched),
+          query_proof_test_require(
+              query_proof_test_rejected(
+                  query_proof_verify_envelope(Layer, Query_Atom, Root,
+                                              Variables, Missing_Unmatched,
+                                              Envelope)),
+              optional_unmatched_omission_accepted),
+          query_proof_test_require(
+              query_proof_test_rejected(
+                  query_proof_verify_envelope(Layer, Query_Atom, Root,
+                                              Variables, [Unmatched|Rows],
+                                              Envelope)),
+              optional_unmatched_duplication_accepted),
+          query_proof_test_require(
+              query_proof_test_rejected(
+                  query_proof_verify_envelope(Layer, Query_Atom, Root,
+                                              Variables,
+                                              [[Matched_O,Shared,T]|Missing_Unmatched],
+                                              Envelope)),
+              optional_forged_nonzero_nullable_id_accepted),
+          query_proof_test_require(
+              query_proof_test_rejected(
+                  query_proof_verify_envelope(Layer, Query_Atom, Root,
+                                              Variables,
+                                              [[null,null,T]|Missing_Unmatched],
+                                              Envelope)),
+              optional_null_shared_key_accepted),
+          query_proof_test_stage(optional_archive_reopen_verify_complete)
         ),
         retract_local_triple_store(Reopened)).
 

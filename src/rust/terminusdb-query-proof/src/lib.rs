@@ -195,5 +195,96 @@ pub fn decode_verify_executed_envelope(
     Ok(verified)
 }
 
+fn scalar_rows(rows: &[Vec<ExecutedResultValue>]) -> io::Result<Vec<Vec<u64>>> {
+    rows.iter()
+        .map(|row| {
+            row.iter()
+                .map(|value| match value {
+                    ExecutedResultValue::Id(value) => Ok(*value),
+                    ExecutedResultValue::Null => Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Count results cannot contain null",
+                    )),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Explicitly prove and encode after binding typed Store-ID/null rows returned by
+/// the ordinary executor. Rust's compiled result descriptors remain authoritative:
+/// `Null` is accepted only in plan-declared nullable columns. Count uses its existing
+/// scalar boundary because zero is a valid count rather than a Store dictionary ID.
+pub fn prove_executed_values_and_encode(
+    layer: &SyncStoreLayer,
+    query_json: &str,
+    expected_root: ProofHash,
+    variables: &[String],
+    rows: &[Vec<ExecutedResultValue>],
+) -> Result<Vec<u8>, ExecutionProofError> {
+    let compiled = compile_json(query_json)?;
+    let proved = prove(layer, &compiled)?;
+    Ok(encode_executed_values_envelope(
+        layer,
+        &compiled,
+        &proved,
+        expected_root,
+        variables,
+        rows,
+    )?)
+}
+
+/// Bind an already generated proof to typed executor values and encode it.
+pub fn encode_executed_values_envelope(
+    layer: &SyncStoreLayer,
+    compiled: &CompiledBgp,
+    proved: &ProvedBgp,
+    expected_root: ProofHash,
+    variables: &[String],
+    rows: &[Vec<ExecutedResultValue>],
+) -> Result<Vec<u8>, QueryProofError> {
+    let commitment = layer.proof_commitment()?;
+    if compiled.count_variable.is_some() {
+        let rows = scalar_rows(rows)?;
+        proved.verify_executed_rows(compiled, &commitment, expected_root, variables, &rows)?;
+    } else {
+        proved.verify_executed_values(compiled, &commitment, expected_root, variables, rows)?;
+    }
+    Ok(proved.encode_envelope(compiled, &commitment, expected_root)?)
+}
+
+/// Decode and verify an envelope, then bind it independently to typed executor values.
+pub fn decode_verify_executed_values_envelope(
+    bytes: &[u8],
+    layer: &SyncStoreLayer,
+    query_json: &str,
+    expected_root: ProofHash,
+    variables: &[String],
+    rows: &[Vec<ExecutedResultValue>],
+) -> Result<VerifiedBgpEnvelope, ExecutionProofError> {
+    let compiled = compile_json(query_json)?;
+    let verified = decode_and_verify_envelope(bytes, layer, &compiled, expected_root)?;
+    let commitment = layer.proof_commitment()?;
+    if compiled.count_variable.is_some() {
+        let rows = scalar_rows(rows)?;
+        verified.proved.verify_executed_rows(
+            &compiled,
+            &commitment,
+            expected_root,
+            variables,
+            &rows,
+        )?;
+    } else {
+        verified.proved.verify_executed_values(
+            &compiled,
+            &commitment,
+            expected_root,
+            variables,
+            rows,
+        )?;
+    }
+    Ok(verified)
+}
+
 pub use terminus_store::proof::ProofHash;
-pub use terminusdb_woql2::proof::QueryProofError as Error;
+pub use terminusdb_woql2::proof::{ExecutedResultValue, QueryProofError as Error};
