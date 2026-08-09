@@ -229,8 +229,8 @@ fn native_boundary_round_trips_correlated_not_rows() {
         ("a", "p", "b"),
         ("c", "p", "d"),
         ("e", "p", "b"),
-        ("b", "q", "u"),
-        ("b", "q", "v"),
+        ("b", "q", "a"),
+        ("b", "q", "e"),
     ] {
         builder
             .add_value_triple(ValueTriple::new_node(
@@ -246,7 +246,8 @@ fn native_boundary_round_trips_correlated_not_rows() {
         and: vec![
             triple("x", "p", "y"),
             Query::Not(Not {
-                query: Box::new(triple("y", "q", "z")),
+                // Both outer variables are correlated, in reversed right-schema order.
+                query: Box::new(triple("y", "q", "x")),
             }),
         ],
     });
@@ -292,4 +293,40 @@ fn native_boundary_round_trips_correlated_not_rows() {
         &forged,
     )
     .is_err());
+
+    // With no shared variables, Prolog negation is one authenticated global gate. The
+    // nonempty q relation suppresses the complete p relation.
+    let global = Query::And(And {
+        and: vec![
+            triple("x", "p", "y"),
+            Query::Not(Not {
+                query: Box::new(triple("a", "q", "b")),
+            }),
+        ],
+    });
+    let global_json = global.to_woql_json().to_string();
+    let global_compiled = compile_json(&global_json).unwrap();
+    assert!(global_compiled
+        .anti_join
+        .as_ref()
+        .unwrap()
+        .key_pairs
+        .is_empty());
+    let global_envelope = terminusdb_query_proof::prove_executed_and_encode(
+        &layer,
+        &global_json,
+        commitment.state.commitment_root,
+        &variables,
+        &[],
+    )
+    .unwrap();
+    decode_verify_executed_envelope(
+        &global_envelope,
+        &layer,
+        &global_json,
+        commitment.state.commitment_root,
+        &variables,
+        &[],
+    )
+    .unwrap();
 }
