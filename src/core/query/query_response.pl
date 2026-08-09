@@ -93,13 +93,15 @@ run_context_ast_jsonld_response_(Context, AST, Requested_Data_Version, Transacti
                         transaction_retry_count : Meta_Data.transaction_retry_count }.
 
 proof_binding_row(none, _Context, _Transaction, []).
-proof_binding_row(some(Query_JSON, _, _), Context, _Transaction, [Count]) :-
+proof_binding_row(some(Query_JSON, _, _), Context, _Transaction,
+                  [generated_decimal(Count_String)]) :-
     query_proof_count_variable(Query_JSON, Count_Name),
     !,
     context_variable_names(Context, [Count_Name]),
     member(Record, Context.bindings),
     Record.var_name = Count_Name,
-    query_proof_count_value(Record.woql_var, Count).
+    query_proof_count_value(Record.woql_var, Count),
+    number_string(Count, Count_String).
 proof_binding_row(some(Query_JSON, _, _), Context, Transaction, Row) :-
     context_variable_names(Context, Names),
     [Instance_Object] = Transaction.instance_objects,
@@ -116,6 +118,9 @@ proof_binding_id(Query_JSON, Context, Layer, Name, Id) :-
     % Goal has no match. The native boundary accepts this atom only where its
     % independently compiled result descriptor marks the column nullable.
     ->  Id = null
+    ;   query_proof_generated_decimal_variable(Query_JSON, Name)
+    ->  query_proof_generated_decimal_value(Value, Decimal_String),
+        Id = generated_decimal(Decimal_String)
     ;   query_proof_predicate_variable(Query_JSON, Name)
     ->  predicate_id(Layer, Value, Id)
     ;   Value = Lexical^^Datatype
@@ -124,6 +129,38 @@ proof_binding_id(Query_JSON, Context, Layer, Name, Id) :-
     ->  object_id(Layer, lang(Lexical, Language), Id)
     ;   object_id(Layer, node(Value), Id)
     ).
+
+% Generated aggregate values are tagged on the foreign wire instead of being confused
+% with Store dictionary IDs. Rust recompiles the query and authoritatively selects the
+% signed or unsigned generated-decimal domain for this lexical integer.
+query_proof_generated_decimal_value(Value, String) :-
+    (   integer(Value)
+    ->  Integer = Value
+    ;   Value = Lexical^^Datatype,
+        memberchk(Datatype,
+                  ['xsd:decimal','http://www.w3.org/2001/XMLSchema#decimal']),
+        integer(Lexical),
+        Integer = Lexical
+    ),
+    number_string(Integer, String).
+
+query_proof_generated_decimal_variable(Query, Name) :-
+    query_proof_json_type(Query, Type),
+    memberchk(Type, ['TripleCount','Sum']),
+    ( Type == 'TripleCount' -> Output = Query.count ; Output = Query.result ),
+    get_dict(variable, Output, Raw_Name),
+    ( atom(Raw_Name) -> Name = Raw_Name ; atom_string(Name, Raw_Name) ).
+query_proof_generated_decimal_variable(Query, Name) :-
+    query_proof_json_type(Query, Wrapper),
+    memberchk(Wrapper,
+              ['Select','Using','From','Pin','Immediately','Distinct','Not']),
+    query_proof_generated_decimal_variable(Query.query, Name).
+query_proof_generated_decimal_variable(Query, Name) :-
+    query_proof_json_type(Query, Junction),
+    memberchk(Junction, ['And','Or']),
+    ( Junction == 'And' -> Children = Query.and ; Children = Query.or ),
+    member(Child, Children),
+    query_proof_generated_decimal_variable(Child, Name).
 
 % Capture predicate bindings in the Store's predicate-ID namespace. Rust independently
 % compiles the same query and rejects a name reused across predicate and S/O positions;

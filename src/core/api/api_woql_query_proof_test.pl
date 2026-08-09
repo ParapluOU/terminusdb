@@ -10,11 +10,36 @@
                              super_user_authority/1]).
 :- use_module(library(filesex), [delete_directory_and_contents/1]).
 :- use_module(library(yall)).
+:- use_module(core(query/query_response), []).
 :- use_module(library(terminus_store), [open_archive_store/3,
                                        query_proof_layer_root/2,
                                        query_proof_verifier_commitment/2,
                                        query_proof_verify_compact_envelope/6,
                                        query_proof_verify_envelope/6]).
+
+:- begin_tests(query_proof_generated_decimal_wire).
+
+test(canonical_signed_unsigned_and_zero_lexicals) :-
+    query_response:query_proof_generated_decimal_value(0^^'xsd:decimal', "0"),
+    query_response:query_proof_generated_decimal_value(
+        -1^^'http://www.w3.org/2001/XMLSchema#decimal', "-1"),
+    query_response:query_proof_generated_decimal_value(18446744073709551615,
+                                                       "18446744073709551615").
+
+test(structural_outputs_survive_wrappers_and_reordering, [nondet]) :-
+    Sum = _{'@type':"Sum", result:_{variable:"total"}},
+    Triple_Count = _{'@type':"TripleCount", count:_{variable:"count"}},
+    Query = _{'@type':"Select", variables:["total","node"],
+              query:_{'@type':"And", and:[Triple_Count,Sum]}},
+    query_response:query_proof_generated_decimal_variable(Query, total),
+    query_response:query_proof_generated_decimal_variable(Query, count),
+    \+ query_response:query_proof_generated_decimal_variable(Query, node).
+
+test(nonintegral_decimal_rejects, [fail]) :-
+    query_response:query_proof_generated_decimal_value(
+        1r2^^'http://www.w3.org/2001/XMLSchema#decimal', _).
+
+:- end_tests(query_proof_generated_decimal_wire).
 
 query_proof_release_tests_enabled :-
     getenv('TERMINUSDB_QUERY_PROOF_RELEASE_TESTS', Value),
@@ -122,8 +147,10 @@ query_proof_test_current_layer(Context, Layer) :-
     [Instance_Object] = Transaction.instance_objects,
     Layer = Instance_Object.read.
 
-% Independently run the normal compiler/executor to reconstruct the Store-ID
-% rows consumed by the native verifier. This is verification, not proof generation.
+% Independently run the normal compiler/executor to reconstruct the foreign-wire
+% rows consumed by the native verifier. Ordinary terms use Store IDs; generated
+% aggregate decimals are explicit lexical wrappers. This is verification, not
+% proof generation.
 query_proof_test_execution_rows(Path, Query, Layer, Variables, Rows) :-
     query_proof_test_system_auth(System_DB, Auth),
     query_proof_test_options(Options),

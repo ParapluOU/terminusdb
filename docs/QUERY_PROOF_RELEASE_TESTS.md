@@ -132,3 +132,19 @@ here would weaken the migration boundary. Store's focused migration tests cover
 v3-to-v4, corrupt v3, interrupted/CAS retry, idempotence, and archive reopen;
 this suite covers the explicit running-node API on the resulting intrinsic PF4
 v4 layer contract.
+
+Generated integral aggregate results cross the Prolog foreign boundary as
+`generated_decimal(CanonicalString)`, never as an ambiguous integer Store ID.
+Rust recompiles the same query and uses its result descriptor to choose the
+unsigned `TripleCount`/unsigned `GroupBy`-`Sum` domain or signed `GroupBy`-`Sum`
+domain. Noncanonical lexical integers, overflow, and value-kind/domain mismatch
+fail closed. The live Count path in the first release fixture exercises this
+wire value through proof generation, ordinary-layer verification, archive
+reopen, and wrong-count rejection.
+
+For a development run that does not overwrite the checked-in shared library,
+build `terminusdb-dylib` and put a temporary `librust.so` symlink first on the
+SWI foreign path. On the 2026-08-09 Linux runner the successful debug artifact
+was `src/rust/target/debug/libterminusdb_dylib.so`; linking required the SWI
+root `lib` directory and the system GCC runtime in `LIBRARY_PATH`. The checked-in
+`src/rust/librust.so` was deliberately left untouched.

@@ -287,6 +287,19 @@ fn canonical_json_grouped_extrema_proves_and_crosses_execution_boundary() {
 }
 
 #[test]
+fn prolog_omitted_default_graph_is_canonical_but_unknown_fields_still_fail_closed() {
+    let explicit = triple("s", "p", "o").to_woql_json();
+    assert_eq!(explicit["graph"], "instance");
+
+    let mut prolog = explicit.clone();
+    prolog.as_object_mut().unwrap().remove("graph");
+    assert!(compile_json(&prolog.to_string()).is_ok());
+
+    prolog["misspelled"] = serde_json::json!(true);
+    assert!(compile_json(&prolog.to_string()).is_err());
+}
+
+#[test]
 fn compact_verifier_artifact_is_smaller_than_pf4_for_materialized_data() {
     let store = open_sync_memory_store();
     let builder = store.create_base_layer().unwrap();

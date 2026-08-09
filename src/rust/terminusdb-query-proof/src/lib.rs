@@ -19,6 +19,7 @@ use terminus_store::store::sync::{SyncStore, SyncStoreLayer};
 use terminusdb_schema::FromTDBInstance;
 use terminusdb_woql2::proof::{
     decode_and_verify_envelope as decode_woql_envelope,
+    decode_executed_result_inputs,
     decode_verifier_commitment_and_verify_envelope as decode_compact_woql_envelope, plan_bgp,
     BgpPlanError, CompiledBgp, ProvedBgp, QueryProofError, VerifiedBgpEnvelope,
 };
@@ -181,6 +182,27 @@ impl QueryProver {
             rows,
         )?)
     }
+
+    pub fn prove_executed_inputs_and_encode(
+        &self,
+        layer: &SyncStoreLayer,
+        query_json: &str,
+        expected_root: ProofHash,
+        variables: &[String],
+        rows: &[Vec<ExecutedResultInput>],
+    ) -> Result<Vec<u8>, ExecutionProofError> {
+        let compiled = compile_json(query_json)?;
+        let rows = decode_executed_result_inputs(&compiled, variables, rows)?;
+        let proved = self.prove(layer, &compiled)?;
+        Ok(encode_executed_values_envelope(
+            layer,
+            &compiled,
+            &proved,
+            expected_root,
+            variables,
+            &rows,
+        )?)
+    }
 }
 
 /// Outcome of an explicitly requested migration of one immutable layer head.
@@ -257,6 +279,25 @@ pub fn compile(query: &Query) -> Result<CompiledBgp, BgpPlanError> {
     plan_bgp(query)
 }
 
+fn omit_default_instance_graphs(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.get("graph").and_then(serde_json::Value::as_str) == Some("instance") {
+                map.remove("graph");
+            }
+            for child in map.values_mut() {
+                omit_default_instance_graphs(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                omit_default_instance_graphs(child);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Parse and compile the normalized WOQL JSON used by the running node.
 pub fn compile_json(query_json: &str) -> Result<CompiledBgp, ExecutionProofError> {
     // Use woql2/schema's canonical JSON-LD decoder. `serde_json::from_str<Query>`
@@ -268,11 +309,14 @@ pub fn compile_json(query_json: &str) -> Result<CompiledBgp, ExecutionProofError
         serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     })?;
     // The generated domain decoder intentionally builds model instances and may
-    // otherwise ignore an unknown property. This trust boundary accepts only the
-    // canonical normalized WOQL representation: round-tripping must reproduce the
-    // exact JSON value, which rejects unknown/misspelled fields without a second
-    // hand-written query decoder.
-    if query.to_woql_json() != supplied {
+    // otherwise ignore an unknown property. Fail closed unless round-tripping
+    // reproduces the input. The Prolog implementation is authoritative and omits
+    // the default instance graph, while woql2's client serializer spells that
+    // default as `"graph":"instance"`; accept exactly that known equivalence.
+    let canonical = query.to_woql_json();
+    let mut prolog_canonical = canonical.clone();
+    omit_default_instance_graphs(&mut prolog_canonical);
+    if supplied != canonical && supplied != prolog_canonical {
         return Err(serde_json::Error::io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "WOQL JSON is not the canonical normalized query representation",
@@ -391,9 +435,11 @@ fn scalar_rows(rows: &[Vec<ExecutedResultValue>]) -> io::Result<Vec<Vec<u64>>> {
             row.iter()
                 .map(|value| match value {
                     ExecutedResultValue::Id(value) => Ok(*value),
-                    ExecutedResultValue::Null => Err(io::Error::new(
+                    ExecutedResultValue::GeneratedDecimalU64(_)
+                    | ExecutedResultValue::GeneratedDecimalI64(_)
+                    | ExecutedResultValue::Null => Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "Count results cannot contain null",
+                        "Count scalar boundary requires a decoded scalar value",
                     )),
                 })
                 .collect()
@@ -413,6 +459,22 @@ pub fn prove_executed_values_and_encode(
     rows: &[Vec<ExecutedResultValue>],
 ) -> Result<Vec<u8>, ExecutionProofError> {
     QueryProver::cpu().prove_executed_values_and_encode(
+        layer,
+        query_json,
+        expected_root,
+        variables,
+        rows,
+    )
+}
+
+pub fn prove_executed_inputs_and_encode(
+    layer: &SyncStoreLayer,
+    query_json: &str,
+    expected_root: ProofHash,
+    variables: &[String],
+    rows: &[Vec<ExecutedResultInput>],
+) -> Result<Vec<u8>, ExecutionProofError> {
+    QueryProver::cpu().prove_executed_inputs_and_encode(
         layer,
         query_json,
         expected_root,
@@ -473,6 +535,39 @@ pub fn decode_verify_executed_values_envelope(
     Ok(verified)
 }
 
+pub fn decode_verify_executed_inputs_envelope(
+    bytes: &[u8],
+    layer: &SyncStoreLayer,
+    query_json: &str,
+    expected_root: ProofHash,
+    variables: &[String],
+    rows: &[Vec<ExecutedResultInput>],
+) -> Result<VerifiedBgpEnvelope, ExecutionProofError> {
+    let compiled = compile_json(query_json)?;
+    let rows = decode_executed_result_inputs(&compiled, variables, rows)?;
+    let verified = decode_and_verify_envelope(bytes, layer, &compiled, expected_root)?;
+    let commitment = layer.proof_commitment()?;
+    if compiled.count_variable.is_some() {
+        let rows = scalar_rows(&rows)?;
+        verified.proved.verify_executed_rows(
+            &compiled,
+            &commitment,
+            expected_root,
+            variables,
+            &rows,
+        )?;
+    } else {
+        verified.proved.verify_executed_values(
+            &compiled,
+            &commitment,
+            expected_root,
+            variables,
+            &rows,
+        )?;
+    }
+    Ok(verified)
+}
+
 /// Compact-artifact variant of [`decode_verify_executed_values_envelope`]. It binds
 /// ordinary executor values without loading a native Store layer or witness tables.
 pub fn decode_verify_executed_values_compact_envelope(
@@ -512,5 +607,67 @@ pub fn decode_verify_executed_values_compact_envelope(
     Ok(verified)
 }
 
+pub fn decode_verify_executed_inputs_compact_envelope(
+    bytes: &[u8],
+    verifier_commitment_bytes: &[u8],
+    query_json: &str,
+    expected_root: ProofHash,
+    variables: &[String],
+    rows: &[Vec<ExecutedResultInput>],
+) -> Result<VerifiedBgpEnvelope, ExecutionProofError> {
+    let compiled = compile_json(query_json)?;
+    let rows = decode_executed_result_inputs(&compiled, variables, rows)?;
+    let verified = decode_and_verify_compact_envelope(
+        bytes,
+        verifier_commitment_bytes,
+        &compiled,
+        expected_root,
+    )?;
+    let commitment = VerifierCommitment::decode(verifier_commitment_bytes)?;
+    if compiled.count_variable.is_some() {
+        let rows = scalar_rows(&rows)?;
+        verified.proved.verify_executed_rows(
+            &compiled,
+            &commitment,
+            expected_root,
+            variables,
+            &rows,
+        )?;
+    } else {
+        verified.proved.verify_executed_values(
+            &compiled,
+            &commitment,
+            expected_root,
+            variables,
+            &rows,
+        )?;
+    }
+    Ok(verified)
+}
+
 pub use terminus_store::proof::ProofHash;
-pub use terminusdb_woql2::proof::{ExecutedResultValue, QueryProofError as Error};
+pub use terminusdb_woql2::proof::{
+    ExecutedResultInput, ExecutedResultValue, QueryProofError as Error,
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn count_scalar_boundary_is_exhaustive_and_never_reinterprets_generated_domains() {
+        assert_eq!(
+            scalar_rows(&[vec![ExecutedResultValue::Id(0)], vec![ExecutedResultValue::Id(7)]])
+                .unwrap(),
+            vec![vec![0], vec![7]],
+        );
+        for value in [
+            ExecutedResultValue::GeneratedDecimalU64(0),
+            ExecutedResultValue::GeneratedDecimalI64(0),
+            ExecutedResultValue::GeneratedDecimalI64(-1),
+            ExecutedResultValue::Null,
+        ] {
+            assert!(scalar_rows(&[vec![value]]).is_err());
+        }
+    }
+}

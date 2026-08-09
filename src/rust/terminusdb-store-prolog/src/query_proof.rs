@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use swipl::prelude::*;
 use terminusdb_query_proof::{
-    decode_verify_executed_values_compact_envelope, decode_verify_executed_values_envelope,
-    encode_verifier_commitment, migrate_legacy_chain, prove_executed_values_and_encode,
-    ExecutedResultValue, ProofHash, QueryBlitzarConfig, QueryProver, QueryProverTier,
+    decode_verify_executed_inputs_compact_envelope, decode_verify_executed_inputs_envelope,
+    encode_verifier_commitment, migrate_legacy_chain, prove_executed_inputs_and_encode,
+    ExecutedResultInput, ProofHash, QueryBlitzarConfig, QueryProver, QueryProverTier,
 };
 
 use crate::layer::WrappedLayer;
@@ -28,24 +28,33 @@ fn expected_root(text: &str) -> io::Result<ProofHash> {
 }
 
 /// Foreign-wire value for an ordinary WOQL result cell. Positive integers are
-/// Store dictionary IDs and the atom `null` is the sole nullable representation.
-/// Whether that atom is legal in a particular column is decided later by the
-/// independently compiled Rust result descriptor.
-struct ProofResultValue(ExecutedResultValue);
+/// Store dictionary IDs, `generated_decimal(String)` carries aggregate output
+/// lexically, and the atom `null` is the sole nullable representation. The
+/// independently compiled Rust result descriptor decides which kind and, for a
+/// generated decimal, which signed domain is legal in each column.
+struct ProofResultValue(ExecutedResultInput);
 
 term_getable! {
-    (ProofResultValue, "positive Store ID or null", term) => {
+    (ProofResultValue, "positive Store ID, generated_decimal(String), or null", term) => {
         if let Ok(id) = term.get::<u64>() {
-            return Some(ProofResultValue(ExecutedResultValue::Id(id)));
+            return Some(ProofResultValue(ExecutedResultInput::Id(id)));
+        }
+        if let Ok(functor) = term.get::<Functor>() {
+            if functor.arity() == 1 && functor.name_string() == "generated_decimal" {
+                let lexical: PrologText = attempt_opt(term.get_arg(1)).unwrap_or(None)?;
+                return Some(ProofResultValue(ExecutedResultInput::GeneratedDecimal(
+                    lexical.into_inner(),
+                )));
+            }
         }
         let is_null = term
             .get_atom_name(|name| name == Some("null"))
             .ok()?;
-        is_null.then_some(ProofResultValue(ExecutedResultValue::Null))
+        is_null.then_some(ProofResultValue(ExecutedResultInput::Null))
     }
 }
 
-fn result_rows(rows: Vec<Vec<ProofResultValue>>) -> Vec<Vec<ExecutedResultValue>> {
+fn result_rows(rows: Vec<Vec<ProofResultValue>>) -> Vec<Vec<ExecutedResultInput>> {
     rows.into_iter()
         .map(|row| row.into_iter().map(|value| value.0).collect())
         .collect()
@@ -122,7 +131,7 @@ predicates! {
     }
 
     /// Explicitly compile/prove/encode after the ordinary Prolog executor has returned
-    /// `rows` as Store IDs in `variables` order.
+    /// foreign-wire `rows` in `variables` order.
     pub semidet fn query_proof_run_envelope(context, layer_term, query_json_term, expected_root_term, variables_term, rows_term, envelope_term) {
         let layer: WrappedLayer = layer_term.get_ex()?;
         let query_json: PrologText = query_json_term.get_ex()?;
@@ -131,7 +140,7 @@ predicates! {
         let rows = result_rows(rows_term.get_ex::<Vec<Vec<ProofResultValue>>>()?);
         let root = context.try_or_die(expected_root(&root_text))?;
         let envelope = context.try_or_die(
-            prove_executed_values_and_encode(&layer, &query_json, root, &variables, &rows)
+            prove_executed_inputs_and_encode(&layer, &query_json, root, &variables, &rows)
                 .map_err(|error| invalid(error.to_string()))
         )?;
         envelope_term.unify(envelope.as_slice())
@@ -149,7 +158,7 @@ predicates! {
         let root = context.try_or_die(expected_root(&root_text))?;
         let envelope = context.try_or_die(
             prover
-                .prove_executed_values_and_encode(&layer, &query_json, root, &variables, &rows)
+                .prove_executed_inputs_and_encode(&layer, &query_json, root, &variables, &rows)
                 .map_err(|error| invalid(error.to_string()))
         )?;
         envelope_term.unify(envelope.as_slice())
@@ -166,7 +175,7 @@ predicates! {
         let envelope: Vec<u8> = envelope_term.get_ex()?;
         let root = context.try_or_die(expected_root(&root_text))?;
         context.try_or_die(
-            decode_verify_executed_values_envelope(
+            decode_verify_executed_inputs_envelope(
                 &envelope,
                 &layer,
                 &query_json,
@@ -190,7 +199,7 @@ predicates! {
         let envelope: Vec<u8> = envelope_term.get_ex()?;
         let root = context.try_or_die(expected_root(&root_text))?;
         context.try_or_die(
-            decode_verify_executed_values_compact_envelope(
+            decode_verify_executed_inputs_compact_envelope(
                 &envelope,
                 &artifact,
                 &query_json,
