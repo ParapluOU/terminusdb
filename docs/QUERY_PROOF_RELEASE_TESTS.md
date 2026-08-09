@@ -29,12 +29,14 @@ TERMINUSDB_QUERY_PROOF_RELEASE_TESTS=true \
   SWIPL_DIR="$DEPS/swipl-env/$TARGET/bin/"
 ```
 
-The suite is not marked concurrent and generates exactly nine proofs: one
+The suite is not marked concurrent and generates exactly eleven proofs: one
 projected BGP, one live `Count` over the same relation, and present/absent
 standalone ground triples (including an object absent from the dictionary), plus
 a present/absent all-ground conjunction, a nested
 `Using`/`From(instance)`/`Pin`/`Immediately` query, and a full-schema `Distinct`
-triple query. All verification, reopen and tamper cases reuse those envelopes.
+triple query, plus present/absent ground gates over the projected BGP. All
+verification, reopen and tamper cases reuse those envelopes; the mixed-gate
+cases also reject swapping the true and false result branches.
 On 2026-08-09 the clean
 release build took 215.47 seconds and the complete suite took 14.19 seconds
 (`user 13.79`, `sys 0.43`) on the development runner. CI should retain a
@@ -62,6 +64,11 @@ the envelope under a changed collection identity. That suite took 28.71 seconds
 With all-ground conjunctions enabled, the nine-proof suite took 32.35 seconds
 (`user 31.97`, `sys 0.41`). The present case intentionally repeats the same
 ground atom, covering conjunction idempotence as well as the zero-arity AND.
+
+With mixed ground/relational gating enabled, the eleven-proof suite took 47.06
+seconds (`user 46.65`, `sys 0.43`). The false gate authenticates an empty result
+at the relational output arity, and the reopen checks reject substituting either
+branch's rows for the other.
 
 The ordinary PlUnit run leaves this suite blocked and performs no query-proof
 work. The suite additionally runs a normal `woql_query_json/9` `Limit` query;
