@@ -1,5 +1,10 @@
 # Query-proof release integration test
 
+The canonical cross-repository accelerator status, benchmark commands, macOS
+limitations, and continuation checklist live in the sibling `terminusdb-rs`
+checkout at `docs/WOQL_QUERY_PROOF_GPU_HANDOFF.md`. This document remains the
+source of truth for the TerminusDB running-node release test.
+
 The full running-node proof test is deliberately serial and opt-in. It builds a
 multi-layer archive database, executes `woql_query_json_with_proof/11`, verifies
 the envelope before and after reopening the archive, and runs the negative
