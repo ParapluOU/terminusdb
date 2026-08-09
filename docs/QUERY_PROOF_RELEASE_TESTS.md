@@ -29,17 +29,20 @@ TERMINUSDB_QUERY_PROOF_RELEASE_TESTS=true \
   SWIPL_DIR="$DEPS/swipl-env/$TARGET/bin/"
 ```
 
-The suite is not marked concurrent and generates exactly twelve proofs: one
+The suite is not marked concurrent and generates exactly thirteen proofs: one
 projected BGP, one live `Count` over the same relation, and present/absent
 standalone ground triples (including an object absent from the dictionary), plus
 a present/absent all-ground conjunction, a nested
 `Using`/`From(instance)`/`Pin`/`Immediately` query, and a full-schema `Distinct`
 triple query, present/absent ground gates over the projected BGP, and a
-disconnected component Cartesian-composed at the multi-layer head. All
+disconnected component Cartesian-composed at the multi-layer head, and an exact
+bag `Or` whose second branch adds a true authenticated ground gate. All
 verification, reopen and tamper cases reuse those envelopes; the mixed-gate
 cases also reject swapping the true and false result branches. The Cartesian
 case rejects reordered components, reordered result metadata, and a duplicated
 product row.
+The `Or` case returns every overlapping row twice and rejects branch reordering,
+a dropped row, and envelope corruption after archive reopen.
 On 2026-08-09 the clean
 release build took 215.47 seconds and the complete suite took 14.19 seconds
 (`user 13.79`, `sys 0.43`) on the development runner. CI should retain a
@@ -77,6 +80,11 @@ With disconnected BGP composition enabled, the twelve-proof suite took 63.05
 seconds (`user 62.65`, `sys 0.42`). Its Cartesian component exists only in the
 child layer, covering the current multi-layer head as well as component/schema
 reordering and duplicate-row rejection after archive reopen.
+
+With exact `Or` bag union enabled, the thirteen-proof suite took 68.43 seconds
+(`user 68.04`, `sys 0.42`). The two branches deliberately overlap completely,
+so all four source rows occur twice; reopen checks reject branch reordering, a
+dropped duplicate, and envelope corruption.
 
 The ordinary PlUnit run leaves this suite blocked and performs no query-proof
 work. The suite additionally runs a normal `woql_query_json/9` `Limit` query;

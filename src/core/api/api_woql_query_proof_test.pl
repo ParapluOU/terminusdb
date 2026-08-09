@@ -239,6 +239,12 @@ query_proof_test_disconnected_query(Base_Query, Query) :-
     append(Base_And.and, [Component], Product_Atoms),
     Query = Base_Query.put(query, Base_And.put(and, Product_Atoms)).
 
+query_proof_test_or_query(Base_Query, Present_Ground, Query) :-
+    [P_Triple|_] = Base_Query.query.and,
+    Gated_Branch = _{'@type':'And', and:[P_Triple,Present_Ground]},
+    Query = Base_Query.put(query,
+        _{'@type':'Or', or:[P_Triple,Gated_Branch]}).
+
 query_proof_test_transparent_wrapper_query(Path, Base_Query, Query) :-
     Query = _{'@type':'Using', collection:Path,
               query:_{'@type':'From', graph:"instance",
@@ -367,6 +373,11 @@ query_proof_test_prepare_closed_archive(Dir, Payload) :-
           query_proof_test_require(Disconnected_Variables = Variables,
                                    disconnected_product_variables_changed),
           query_proof_test_stage(disconnected_product_native_verify_complete),
+          query_proof_test_or_query(Query, Present_Ground, Or_Query),
+          query_proof_test_verified_case(Path, Or_Query, Root,
+                                         Or_Envelope, Or_Variables, Or_Rows),
+          query_proof_test_require(length(Or_Rows, 8), or_bag_length_changed),
+          query_proof_test_stage(or_bag_union_native_verify_complete),
           query_proof_test_transparent_wrapper_query(Path, Query, Wrapper_Query),
           query_proof_test_verified_case(Path, Wrapper_Query, Root,
                                          Wrapper_Envelope, Wrapper_Variables, Wrapper_Rows),
@@ -390,6 +401,7 @@ query_proof_test_prepare_closed_archive(Dir, Payload) :-
                             Absent_Gated_Variables,Absent_Gated_Rows,
                             Disconnected_Query,Disconnected_Envelope,
                             Disconnected_Variables,Disconnected_Rows,
+                            Or_Query,Or_Envelope,Or_Variables,Or_Rows,
                             Wrapper_Query,Wrapper_Envelope,Wrapper_Variables,Wrapper_Rows,
                             Distinct_Query,Distinct_Envelope,Distinct_Variables,Distinct_Rows)
         ),
@@ -418,6 +430,7 @@ test(running_node_multilayer_archive_envelope,
                       Absent_Gated_Variables,Absent_Gated_Rows,
                       Disconnected_Query,Disconnected_Envelope,
                       Disconnected_Variables,Disconnected_Rows,
+                      Or_Query,Or_Envelope,Or_Variables,Or_Rows,
                       Wrapper_Query,Wrapper_Envelope,Wrapper_Variables,Wrapper_Rows,
                       Distinct_Query,Distinct_Envelope,Distinct_Variables,Distinct_Rows),
     open_archive_store(Dir, 8, Reopened),
@@ -609,6 +622,38 @@ test(running_node_multilayer_archive_envelope,
                                               Disconnected_Envelope)),
               duplicated_disconnected_product_row_accepted),
           query_proof_test_stage(disconnected_product_reopen_verify_complete),
+          query_proof_test_execution_rows(Path, Or_Query, Or_Layer,
+                                          Or_Variables, Or_Rows),
+          atom_json_dict(Or_Atom, Or_Query, []),
+          query_proof_verify_envelope(Or_Layer, Or_Atom, Root,
+                                      Or_Variables, Or_Rows, Or_Envelope),
+          [First_Or_Branch,Second_Or_Branch] = Or_Query.query.or,
+          Reordered_Or_Query = Or_Query.put(query,
+              Or_Query.query.put(or,
+                  [Second_Or_Branch,First_Or_Branch])),
+          atom_json_dict(Reordered_Or_Atom, Reordered_Or_Query, []),
+          query_proof_test_require(
+              query_proof_test_rejected(
+                  query_proof_verify_envelope(Or_Layer, Reordered_Or_Atom, Root,
+                                              Or_Variables, Or_Rows,
+                                              Or_Envelope)),
+              reordered_or_branches_accepted),
+          [_Dropped_Or_Row|Missing_Or_Row_Multiset] = Or_Rows,
+          query_proof_test_require(
+              query_proof_test_rejected(
+                  query_proof_verify_envelope(Or_Layer, Or_Atom, Root,
+                                              Or_Variables,
+                                              Missing_Or_Row_Multiset,
+                                              Or_Envelope)),
+              dropped_or_row_accepted),
+          query_proof_test_corrupt_envelope(Or_Envelope, Corrupt_Or_Envelope),
+          query_proof_test_require(
+              query_proof_test_rejected(
+                  query_proof_verify_envelope(Or_Layer, Or_Atom, Root,
+                                              Or_Variables, Or_Rows,
+                                              Corrupt_Or_Envelope)),
+              corrupt_or_envelope_accepted),
+          query_proof_test_stage(or_bag_union_reopen_verify_complete),
           query_proof_test_execution_rows(Path, Wrapper_Query, Wrapper_Layer,
                                           Wrapper_Variables, Wrapper_Rows),
           atom_json_dict(Wrapper_Atom, Wrapper_Query, []),
