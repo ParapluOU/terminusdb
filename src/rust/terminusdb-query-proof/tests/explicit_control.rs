@@ -6,7 +6,7 @@ use terminusdb_query_proof::{
     encode_envelope, encode_executed_envelope, prove,
 };
 use terminusdb_woql2::misc::Count;
-use terminusdb_woql2::query::{And, Query};
+use terminusdb_woql2::query::{And, Not, Query};
 use terminusdb_woql2::triple::Triple;
 use terminusdb_woql2::value::{DataValue, NodeValue, Value};
 
@@ -219,4 +219,77 @@ fn caller_explicitly_compiles_proves_and_selects_the_trusted_root() {
     let mut wrong_root = commitment.state.commitment_root;
     wrong_root[0] ^= 0xff;
     assert!(proved.verify(&compiled, &commitment, wrong_root).is_err());
+}
+
+#[test]
+fn native_boundary_round_trips_correlated_not_rows() {
+    let store = open_sync_memory_store();
+    let builder = store.create_base_layer().unwrap();
+    for (subject, predicate, object) in [
+        ("a", "p", "b"),
+        ("c", "p", "d"),
+        ("e", "p", "b"),
+        ("b", "q", "u"),
+        ("b", "q", "v"),
+    ] {
+        builder
+            .add_value_triple(ValueTriple::new_node(
+                &iri(subject),
+                &iri(predicate),
+                &iri(object),
+            ))
+            .unwrap();
+    }
+    let layer = builder.commit().unwrap();
+    let commitment = layer.proof_commitment().unwrap();
+    let query = Query::And(And {
+        and: vec![
+            triple("x", "p", "y"),
+            Query::Not(Not {
+                query: Box::new(triple("y", "q", "z")),
+            }),
+        ],
+    });
+    let query_json = query.to_woql_json().to_string();
+    let compiled = compile_json(&query_json).unwrap();
+    assert!(compiled.anti_join.is_some());
+    let id = |name: &str| {
+        commitment
+            .node_value_catalog
+            .iter()
+            .find(|record| record.triple.object == CanonicalObject::Node(iri(name).into_bytes()))
+            .unwrap()
+            .object_id
+    };
+    let variables = vec!["x".into(), "y".into()];
+    let rows = vec![vec![id("c"), id("d")]];
+    let envelope = terminusdb_query_proof::prove_executed_and_encode(
+        &layer,
+        &query_json,
+        commitment.state.commitment_root,
+        &variables,
+        &rows,
+    )
+    .unwrap();
+    let verified = decode_verify_executed_envelope(
+        &envelope,
+        &layer,
+        &query_json,
+        commitment.state.commitment_root,
+        &variables,
+        &rows,
+    )
+    .unwrap();
+    assert_eq!(verified.proved.result_len, 1);
+
+    let forged = vec![vec![id("a"), id("b")]];
+    assert!(decode_verify_executed_envelope(
+        &envelope,
+        &layer,
+        &query_json,
+        commitment.state.commitment_root,
+        &variables,
+        &forged,
+    )
+    .is_err());
 }
