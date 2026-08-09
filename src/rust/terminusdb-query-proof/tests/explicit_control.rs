@@ -1,10 +1,12 @@
+use terminus_store::proof::query::CanonicalResultValue;
 use terminus_store::proof::CanonicalObject;
-use terminus_store::store::sync::open_sync_memory_store;
-use terminus_store::ValueTriple;
+use terminus_store::store::sync::{open_sync_archive_store, open_sync_memory_store};
+use terminus_store::{Layer, ValueTriple};
 use terminusdb_query_proof::{
     compile, compile_json, decode_and_verify_envelope, decode_verify_executed_envelope,
     encode_envelope, encode_executed_envelope, prove,
 };
+use terminusdb_woql2::control::WoqlOptional;
 use terminusdb_woql2::misc::Count;
 use terminusdb_woql2::query::{And, Not, Or, Query};
 use terminusdb_woql2::triple::Triple;
@@ -394,4 +396,60 @@ fn native_boundary_round_trips_correlated_not_rows() {
         &[],
     )
     .unwrap();
+}
+
+#[test]
+fn recursive_optional_then_not_envelope_survives_archive_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = open_sync_archive_store(directory.path(), 8);
+    let builder = store.create_base_layer().unwrap();
+    for (subject, predicate, object) in [
+        ("a", "p", "b"),
+        ("c", "p", "d"),
+        ("b", "q", "u"),
+        ("a", "r", "blocked"),
+    ] {
+        builder
+            .add_value_triple(ValueTriple::new_node(
+                &iri(subject),
+                &iri(predicate),
+                &iri(object),
+            ))
+            .unwrap();
+    }
+    let layer = builder.commit().unwrap();
+    let layer_id = layer.name();
+    let query = Query::And(And {
+        and: vec![
+            triple("x", "p", "y"),
+            Query::WoqlOptional(WoqlOptional {
+                query: Box::new(triple("y", "q", "z")),
+            }),
+            Query::Not(Not {
+                query: Box::new(triple("x", "r", "reason")),
+            }),
+        ],
+    });
+    let compiled = compile(&query).unwrap();
+    assert!(compiled.relation.as_left_anti().is_some());
+    let commitment = layer.proof_commitment().unwrap();
+    let trusted_root = commitment.state.commitment_root;
+    let proved = prove(&layer, &compiled).unwrap();
+    assert_eq!(proved.result_len, 1);
+    let envelope = encode_envelope(&layer, &compiled, &proved, trusted_root).unwrap();
+
+    drop(proved);
+    drop(commitment);
+    drop(layer);
+    drop(store);
+
+    let reopened = open_sync_archive_store(directory.path(), 8);
+    let reopened_layer = reopened.get_layer_from_id(layer_id).unwrap().unwrap();
+    let verified =
+        decode_and_verify_envelope(&envelope, &reopened_layer, &compiled, trusted_root).unwrap();
+    assert_eq!(verified.proved.result_len, 1);
+    assert!(matches!(
+        verified.result_values.as_ref().unwrap()[2][0],
+        CanonicalResultValue::Null
+    ));
 }
