@@ -219,10 +219,11 @@ query_proof_test_ground_case(Path, Query, Root, Expected_Bindings,
     atom_json_dict(Query_Atom, Query, []),
     query_proof_verify_envelope(Layer, Query_Atom, Root, Variables, Rows, Envelope).
 
-query_proof_test_transparent_wrapper_query(Base_Query, Query) :-
-    Query = _{'@type':'From', graph:"instance",
-              query:_{'@type':'Pin',
-                      query:_{'@type':'Immediately', query:Base_Query}}}.
+query_proof_test_transparent_wrapper_query(Path, Base_Query, Query) :-
+    Query = _{'@type':'Using', collection:Path,
+              query:_{'@type':'From', graph:"instance",
+                      query:_{'@type':'Pin',
+                              query:_{'@type':'Immediately', query:Base_Query}}}}.
 
 query_proof_test_distinct_triple_query(
     _{'@type':'Distinct', variables:["S","T"],
@@ -305,7 +306,7 @@ query_proof_test_prepare_closed_archive(Dir, Payload) :-
                                        Unknown_Envelope, Unknown_Variables, Unknown_Rows),
           query_proof_test_require(Unknown_Rows = [], unknown_ground_rows_changed),
           query_proof_test_stage(unknown_ground_native_verify_complete),
-          query_proof_test_transparent_wrapper_query(Query, Wrapper_Query),
+          query_proof_test_transparent_wrapper_query(Path, Query, Wrapper_Query),
           query_proof_test_verified_case(Path, Wrapper_Query, Root,
                                          Wrapper_Envelope, Wrapper_Variables, Wrapper_Rows),
           query_proof_test_stage(transparent_wrappers_native_verify_complete),
@@ -429,6 +430,14 @@ test(running_node_multilayer_archive_envelope,
           atom_json_dict(Wrapper_Atom, Wrapper_Query, []),
           query_proof_verify_envelope(Wrapper_Layer, Wrapper_Atom, Root,
                                       Wrapper_Variables, Wrapper_Rows, Wrapper_Envelope),
+          Wrong_Routing_Query = Wrapper_Query.put(collection, "admin/not-proof"),
+          atom_json_dict(Wrong_Routing_Atom, Wrong_Routing_Query, []),
+          query_proof_test_require(
+              query_proof_test_rejected(
+                  query_proof_verify_envelope(Wrapper_Layer, Wrong_Routing_Atom, Root,
+                                              Wrapper_Variables, Wrapper_Rows,
+                                              Wrapper_Envelope)),
+              wrong_using_collection_accepted),
           query_proof_test_stage(transparent_wrappers_reopen_verify_complete),
           query_proof_test_execution_rows(Path, Distinct_Query, Distinct_Layer,
                                           Distinct_Variables, Distinct_Rows),
