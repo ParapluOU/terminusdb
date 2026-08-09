@@ -29,7 +29,7 @@ TERMINUSDB_QUERY_PROOF_RELEASE_TESTS=true \
   SWIPL_DIR="$DEPS/swipl-env/$TARGET/bin/"
 ```
 
-The suite is not marked concurrent and generates exactly thirteen proofs: one
+The suite is not marked concurrent and generates exactly fifteen proofs: one
 projected BGP, one live `Count` over the same relation, and present/absent
 standalone ground triples (including an object absent from the dictionary), plus
 a present/absent all-ground conjunction, a nested
@@ -43,6 +43,15 @@ case rejects reordered components, reordered result metadata, and a duplicated
 product row.
 The `Or` case returns every overlapping row twice and rejects branch reordering,
 a dropped row, and envelope corruption after archive reopen.
+The fourteenth proof is a correlated `Optional` with duplicate matches and one
+unmatched left row. Its ordinary and proof-mode JSON both expose the unbound value
+as `null`; the native row boundary carries the atom `null`, reopens and verifies the
+envelope from an archive, and rejects omission, duplication, a forged nonzero value
+in the nullable column, and `null` in the shared key.
+The fifteenth is a global `Optional` whose authenticated right relation is empty;
+it null-extends every left row across predicate and node/object namespaces, survives
+archive reopen, and rejects missing/extra rows, predicate-namespace substitution,
+and `null` in a nonnullable left column.
 On 2026-08-09 the clean
 release build took 215.47 seconds and the complete suite took 14.19 seconds
 (`user 13.79`, `sys 0.43`) on the development runner. CI should retain a
@@ -85,6 +94,14 @@ With exact `Or` bag union enabled, the thirteen-proof suite took 68.43 seconds
 (`user 68.04`, `sys 0.42`). The two branches deliberately overlap completely,
 so all four source rows occur twice; reopen checks reject branch reordering, a
 dropped duplicate, and envelope corruption.
+
+With correlated `Optional` enabled, the fourteen-proof optimized suite took 88.15
+seconds (`user 87.65`, `sys 0.53`). The incremental release dylib rebuild after the
+nullable/global Optional work took 100.53 seconds.
+
+The focused global-Optional live/archive case took 33.49 seconds (`user 33.09`,
+`sys 0.40`) using the same optimized dylib. The final complete fifteen-proof,
+three-test suite took 117.63 seconds (`user 117.10`, `sys 0.58`).
 
 The ordinary PlUnit run leaves this suite blocked and performs no query-proof
 work. The suite additionally runs a normal `woql_query_json/9` `Limit` query;
