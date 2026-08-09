@@ -29,14 +29,17 @@ TERMINUSDB_QUERY_PROOF_RELEASE_TESTS=true \
   SWIPL_DIR="$DEPS/swipl-env/$TARGET/bin/"
 ```
 
-The suite is not marked concurrent and generates exactly eleven proofs: one
+The suite is not marked concurrent and generates exactly twelve proofs: one
 projected BGP, one live `Count` over the same relation, and present/absent
 standalone ground triples (including an object absent from the dictionary), plus
 a present/absent all-ground conjunction, a nested
 `Using`/`From(instance)`/`Pin`/`Immediately` query, and a full-schema `Distinct`
-triple query, plus present/absent ground gates over the projected BGP. All
+triple query, present/absent ground gates over the projected BGP, and a
+disconnected component Cartesian-composed at the multi-layer head. All
 verification, reopen and tamper cases reuse those envelopes; the mixed-gate
-cases also reject swapping the true and false result branches.
+cases also reject swapping the true and false result branches. The Cartesian
+case rejects reordered components, reordered result metadata, and a duplicated
+product row.
 On 2026-08-09 the clean
 release build took 215.47 seconds and the complete suite took 14.19 seconds
 (`user 13.79`, `sys 0.43`) on the development runner. CI should retain a
@@ -69,6 +72,11 @@ With mixed ground/relational gating enabled, the eleven-proof suite took 47.06
 seconds (`user 46.65`, `sys 0.43`). The false gate authenticates an empty result
 at the relational output arity, and the reopen checks reject substituting either
 branch's rows for the other.
+
+With disconnected BGP composition enabled, the twelve-proof suite took 63.05
+seconds (`user 62.65`, `sys 0.42`). Its Cartesian component exists only in the
+child layer, covering the current multi-layer head as well as component/schema
+reordering and duplicate-row rejection after archive reopen.
 
 The ordinary PlUnit run leaves this suite blocked and performs no query-proof
 work. The suite additionally runs a normal `woql_query_json/9` `Limit` query;
