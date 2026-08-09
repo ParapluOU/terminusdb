@@ -194,13 +194,16 @@ query_proof_test_assert_count_json(JSON) :-
     get_dict('@value', Count_Object, Count),
     Count =:= 5.
 
-query_proof_test_ground_queries(Present, Absent) :-
+query_proof_test_ground_queries(Present, Absent, Unknown) :-
     query_proof_test_node("http://example.com/proof/alice", Alice),
     query_proof_test_node("http://example.com/proof/p", Predicate),
     query_proof_test_node_value("http://example.com/proof/bob", Bob),
     query_proof_test_node_value("http://example.com/proof/erin", Erin),
+    query_proof_test_node_value("http://example.com/proof/unknown", Unknown_Object),
     Present = _{'@type':'Triple', subject:Alice, predicate:Predicate, object:Bob},
-    Absent = _{'@type':'Triple', subject:Alice, predicate:Predicate, object:Erin}.
+    Absent = _{'@type':'Triple', subject:Alice, predicate:Predicate, object:Erin},
+    Unknown = _{'@type':'Triple', subject:Alice, predicate:Predicate,
+                object:Unknown_Object}.
 
 query_proof_test_ground_case(Path, Query, Root, Expected_Bindings,
                              Envelope, Variables, Rows) :-
@@ -289,7 +292,7 @@ query_proof_test_prepare_closed_archive(Dir, Payload) :-
           query_proof_verify_envelope(Count_Layer, Count_Query_Atom, Root,
                                       Count_Variables, Count_Rows, Count_Envelope),
           query_proof_test_stage(count_native_verify_complete),
-          query_proof_test_ground_queries(Present_Ground, Absent_Ground),
+          query_proof_test_ground_queries(Present_Ground, Absent_Ground, Unknown_Ground),
           query_proof_test_ground_case(Path, Present_Ground, Root, [_{}],
                                        Present_Envelope, Present_Variables, Present_Rows),
           query_proof_test_require(Present_Rows = [[]], present_ground_rows_changed),
@@ -298,6 +301,10 @@ query_proof_test_prepare_closed_archive(Dir, Payload) :-
                                        Absent_Envelope, Absent_Variables, Absent_Rows),
           query_proof_test_require(Absent_Rows = [], absent_ground_rows_changed),
           query_proof_test_stage(absent_ground_native_verify_complete),
+          query_proof_test_ground_case(Path, Unknown_Ground, Root, [],
+                                       Unknown_Envelope, Unknown_Variables, Unknown_Rows),
+          query_proof_test_require(Unknown_Rows = [], unknown_ground_rows_changed),
+          query_proof_test_stage(unknown_ground_native_verify_complete),
           query_proof_test_transparent_wrapper_query(Query, Wrapper_Query),
           query_proof_test_verified_case(Path, Wrapper_Query, Root,
                                          Wrapper_Envelope, Wrapper_Variables, Wrapper_Rows),
@@ -310,6 +317,7 @@ query_proof_test_prepare_closed_archive(Dir, Payload) :-
                             Count_Query,Count_Envelope,Count_Variables,Count_Rows,
                             Present_Ground,Present_Envelope,Present_Variables,Present_Rows,
                             Absent_Ground,Absent_Envelope,Absent_Variables,Absent_Rows,
+                            Unknown_Ground,Unknown_Envelope,Unknown_Variables,Unknown_Rows,
                             Wrapper_Query,Wrapper_Envelope,Wrapper_Variables,Wrapper_Rows,
                             Distinct_Query,Distinct_Envelope,Distinct_Variables,Distinct_Rows)
         ),
@@ -327,6 +335,7 @@ test(running_node_multilayer_archive_envelope,
                       Count_Query,Count_Envelope,Count_Variables,Count_Rows,
                       Present_Ground,Present_Envelope,Present_Variables,Present_Rows,
                       Absent_Ground,Absent_Envelope,Absent_Variables,Absent_Rows,
+                      Unknown_Ground,Unknown_Envelope,Unknown_Variables,Unknown_Rows,
                       Wrapper_Query,Wrapper_Envelope,Wrapper_Variables,Wrapper_Rows,
                       Distinct_Query,Distinct_Envelope,Distinct_Variables,Distinct_Rows),
     open_archive_store(Dir, 8, Reopened),
@@ -404,6 +413,17 @@ test(running_node_multilayer_archive_envelope,
                                               Absent_Variables, [[]], Absent_Envelope)),
               absent_ground_insertion_accepted),
           query_proof_test_stage(absent_ground_reopen_verify_complete),
+          query_proof_test_execution_rows(Path, Unknown_Ground, Unknown_Layer,
+                                          Unknown_Variables, Unknown_Rows),
+          atom_json_dict(Unknown_Atom, Unknown_Ground, []),
+          query_proof_verify_envelope(Unknown_Layer, Unknown_Atom, Root,
+                                      Unknown_Variables, Unknown_Rows, Unknown_Envelope),
+          query_proof_test_require(
+              query_proof_test_rejected(
+                  query_proof_verify_envelope(Unknown_Layer, Unknown_Atom, Root,
+                                              Unknown_Variables, [[]], Unknown_Envelope)),
+              unknown_ground_insertion_accepted),
+          query_proof_test_stage(unknown_ground_reopen_verify_complete),
           query_proof_test_execution_rows(Path, Wrapper_Query, Wrapper_Layer,
                                           Wrapper_Variables, Wrapper_Rows),
           atom_json_dict(Wrapper_Atom, Wrapper_Query, []),

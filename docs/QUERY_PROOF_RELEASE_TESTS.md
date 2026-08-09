@@ -29,11 +29,12 @@ TERMINUSDB_QUERY_PROOF_RELEASE_TESTS=true \
   SWIPL_DIR="$DEPS/swipl-env/$TARGET/bin/"
 ```
 
-The suite is not marked concurrent and generates exactly six proofs: one
+The suite is not marked concurrent and generates exactly seven proofs: one
 projected BGP, one live `Count` over the same relation, and present/absent
-standalone ground triples, plus a nested `From(instance)`/`Pin`/`Immediately`
-query and a full-schema `Distinct` triple query. All verification, reopen and
-tamper cases reuse those envelopes. On 2026-08-09 the clean
+standalone ground triples (including an object absent from the dictionary), plus
+a nested `From(instance)`/`Pin`/`Immediately` query and a full-schema `Distinct`
+triple query. All verification, reopen and tamper cases reuse those envelopes.
+On 2026-08-09 the clean
 release build took 215.47 seconds and the complete suite took 14.19 seconds
 (`user 13.79`, `sys 0.43`) on the development runner. CI should retain a
 5-minute suite timeout and record `/usr/bin/time` output for regressions. A
@@ -49,6 +50,9 @@ is absent; dictionary-term nonmembership remains a fail-closed planner boundary.
 
 After adding transparent-wrapper and full-schema `Distinct` coverage, the
 incremental optimized suite took 28.10 seconds (`user 27.71`, `sys 0.41`).
+
+With root-authenticated dictionary absence enabled, the seven-proof suite took
+28.44 seconds (`user 28.06`, `sys 0.40`).
 
 The ordinary PlUnit run leaves this suite blocked and performs no query-proof
 work. The suite additionally runs a normal `woql_query_json/9` `Limit` query;
