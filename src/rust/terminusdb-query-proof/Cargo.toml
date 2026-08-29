@@ -6,12 +6,13 @@ publish = false
 
 [features]
 default = []
-blitzar-cpu = ["terminus-store/blitzar-cpu", "terminusdb-woql2/blitzar-cpu"]
-blitzar-gpu = ["terminus-store/blitzar-gpu", "terminusdb-woql2/blitzar-gpu"]
+blitzar-cpu = ["terminus-store/blitzar-cpu", "terminusdb-woql-proof/blitzar-cpu"]
+blitzar-gpu = ["terminus-store/blitzar-gpu", "terminusdb-woql-proof/blitzar-gpu"]
 
 [dependencies]
 terminus-store = { version = "0.21.8", features = [] }
-terminusdb-woql2 = { path = "../../../../terminusdb-rs/crates/woql2", features = ["proof"] }
+terminusdb-woql2 = { path = "../../../../terminusdb-rs/crates/woql2" }
+terminusdb-woql-proof = { path = "../../../../terminusdb-rs/crates/woql-proof" }
 terminusdb-schema = { path = "../../../../terminusdb-rs/crates/schema" }
 serde_json = "1.0"
 thiserror = "2"

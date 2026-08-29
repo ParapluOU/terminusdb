@@ -17,7 +17,7 @@ use terminus_store::proof::argument::{ProverSetupTier, StoreProverContext};
 use terminus_store::proof::commitment::VerifierCommitment;
 use terminus_store::store::sync::{SyncStore, SyncStoreLayer};
 use terminusdb_schema::FromTDBInstance;
-use terminusdb_woql2::proof::{
+use terminusdb_woql_proof::proof::{
     decode_and_verify_envelope as decode_woql_envelope,
     decode_executed_result_inputs,
     decode_verifier_commitment_and_verify_envelope as decode_compact_woql_envelope, plan_bgp,
@@ -646,7 +646,7 @@ pub fn decode_verify_executed_inputs_compact_envelope(
 }
 
 pub use terminus_store::proof::ProofHash;
-pub use terminusdb_woql2::proof::{
+pub use terminusdb_woql_proof::proof::{
     ExecutedResultInput, ExecutedResultValue, QueryProofError as Error,
 };
 
