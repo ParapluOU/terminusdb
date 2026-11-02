@@ -75,7 +75,19 @@ pub fn start_with_routes(
     let (tx, rx) = std::sync::mpsc::channel();
 
     std::thread::spawn(move || {
-        let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        // TERMINUSDB_SERVER_HOST picks the interface (default: all of them); a node
+        // that only serves its own processes binds 127.0.0.1
+        let host: std::net::IpAddr = match std::env::var("TERMINUSDB_SERVER_HOST") {
+            Ok(host) => match host.parse() {
+                Ok(ip) => ip,
+                Err(_) => {
+                    let _ = tx.send(Err(format!("TERMINUSDB_SERVER_HOST is not an IP address: {host}")));
+                    return;
+                }
+            },
+            Err(_) => std::net::IpAddr::from([0, 0, 0, 0]),
+        };
+        let addr = SocketAddr::new(host, port);
 
         // Use socket2 to create a listener with a large backlog. The
         // default backlog (128 on macOS) is too small for high connection
