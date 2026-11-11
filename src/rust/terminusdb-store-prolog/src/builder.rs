@@ -85,6 +85,14 @@ predicates! {
         layer_term.unify(WrappedLayer(layer))
     }
 
+    /// Commit without proof state, whatever the store's proof-state mode.
+    /// The system graph is committed this way: it is never proven.
+    pub semidet fn nb_commit_without_proof(context, builder_term, layer_term) {
+        let builder: WrappedBuilder = builder_term.get_ex()?;
+        let layer = context.try_or_die(builder.commit_without_proof())?;
+        layer_term.unify(WrappedLayer(layer))
+    }
+
     pub semidet fn nb_apply_delta(context, builder_term, layer_term) {
         let builder: WrappedBuilder = builder_term.get_ex()?;
         let layer: WrappedLayer = layer_term.get_ex()?;

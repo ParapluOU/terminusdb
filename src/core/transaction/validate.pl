@@ -78,7 +78,7 @@ read_write_obj_to_graph_validation_obj(Read_Write_Obj, Graph_Validation_Obj, Map
         ->  Changed = true
         ;   Changed = false)
     %   NOTE: This seems wasteful - we should ignore this layer not commit it if it is empty.
-    ;   nb_commit(Layer_Builder, New_Layer),
+    ;   commit_graph_layer(Descriptor, Layer_Builder, New_Layer),
         '$change_window':layer_changes(New_Layer, Added, Removed),
         Layer_Changes = Added-Removed,
         graph_inserts_deletes(Graph_Validation_Obj, N, M),
@@ -87,6 +87,16 @@ read_write_obj_to_graph_validation_obj(Read_Write_Obj, Graph_Validation_Obj, Map
     ;   Changed = false,
         Layer_Changes = []-[],
         New_Layer = Layer ).
+
+%% commit_graph_layer(+Descriptor, +Builder, -Layer) is det.
+%
+% The system graph is never proven: its layers are committed without proof
+% state, whatever the store's proof-state mode (TERMINUSDB_PROOF_STATE).
+commit_graph_layer(Descriptor, Layer_Builder, New_Layer) :-
+    (   is_dict(Descriptor, system_graph)
+    ->  nb_commit_without_proof(Layer_Builder, New_Layer)
+    ;   nb_commit(Layer_Builder, New_Layer)
+    ).
 
 graph_validation_obj_to_read_write_obj(Graph_Validation_Obj, Read_Write_Obj, Map, Map) :-
     memberchk(Graph_Validation_Obj=Read_Write_Obj, Map),

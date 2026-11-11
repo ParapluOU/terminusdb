@@ -8,6 +8,7 @@ use terminus_store::storage::archive::DirectoryArchiveBackend;
 use terminus_store::storage::archive::LruArchiveBackend;
 use terminus_store::storage::CachedLayerStore;
 use terminus_store::storage::LockingHashMapLayerCache;
+use terminus_store::storage::ProofStateMode;
 use terminus_store::storage::{
     archive::ArchiveLayerStore, name_to_string, pack_layer_parents, string_to_name, PackError,
 };
@@ -78,27 +79,27 @@ fn get_process_rss_bytes() -> Option<usize> {
 }
 
 predicates! {
-    pub semidet fn open_memory_store(_context, term) {
-        let store = open_sync_memory_store();
+    pub semidet fn open_memory_store(context, term) {
+        let store = open_sync_memory_store().with_proof_state(context.try_or_die(ProofStateMode::from_env())?);
         term.unify(&WrappedStore(store))
     }
 
-    pub semidet fn open_directory_store(_context, dir_term, out_term) {
+    pub semidet fn open_directory_store(context, dir_term, out_term) {
         let dir: PrologText = dir_term.get_ex()?;
-        let store = open_sync_directory_store(&*dir);
+        let store = open_sync_directory_store(&*dir).with_proof_state(context.try_or_die(ProofStateMode::from_env())?);
         out_term.unify(&WrappedStore(store))
     }
 
-    pub semidet fn open_raw_archive_store(_context, dir_term, out_term) {
+    pub semidet fn open_raw_archive_store(context, dir_term, out_term) {
         let dir: PrologText = dir_term.get_ex()?;
-        let store = open_sync_raw_archive_store(&*dir);
+        let store = open_sync_raw_archive_store(&*dir).with_proof_state(context.try_or_die(ProofStateMode::from_env())?);
         out_term.unify(&WrappedStore(store))
     }
 
-    pub semidet fn open_archive_store(_context, dir_term, cache_size_term, out_term) {
+    pub semidet fn open_archive_store(context, dir_term, cache_size_term, out_term) {
         let dir: PrologText = dir_term.get_ex()?;
         let cache_size: usize = cache_size_term.get_ex::<u64>()? as usize;
-        let store = open_sync_archive_store(&*dir, cache_size);
+        let store = open_sync_archive_store(&*dir, cache_size).with_proof_state(context.try_or_die(ProofStateMode::from_env())?);
         out_term.unify(&WrappedStore(store))
     }
 
@@ -117,7 +118,8 @@ predicates! {
 
         let store = SyncStore::wrap(Store::new(label_store, layer_store)
             .with_lru_used_bytes(move || lru_ref.used_bytes())
-            .with_lru_evict(move |fraction| lru_evict_ref.evict_to_target(fraction)));
+            .with_lru_evict(move |fraction| lru_evict_ref.evict_to_target(fraction))
+            .with_proof_state(context.try_or_die(ProofStateMode::from_env())?));
 
         out_term.unify(&WrappedStore(store))
     }

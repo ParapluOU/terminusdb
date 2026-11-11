@@ -23,6 +23,7 @@
               nb_add_triple/4,
               nb_remove_triple/4,
               nb_commit/2,
+              nb_commit_without_proof/2,
               builder_committed/1,
               nb_apply_delta/2,
               nb_apply_diff/2,
@@ -311,6 +312,16 @@ terminus_store_version('0.19.8').
 %! nb_commit(+Builder:layer_builder, -Layer:layer) is det.
 %
 % Commit the layer builder, turning it into a layer.
+%
+% @arg Builder the layer builder to commit.
+% @arg Layer the layer that will be returned.
+% @throws if the builder has already been committed.
+
+%! nb_commit_without_proof(+Builder:layer_builder, -Layer:layer) is det.
+%
+% Commit the layer builder without proof state, whatever the store's
+% proof-state mode (TERMINUSDB_PROOF_STATE). Used for the system graph,
+% which is never proven.
 %
 % @arg Builder the layer builder to commit.
 % @arg Layer the layer that will be returned.

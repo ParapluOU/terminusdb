@@ -33,6 +33,7 @@ pub fn install(module: Option<&str>) {
     builder::register_nb_remove_object_triple_in_module(module);
     builder::register_builder_committed_in_module(module);
     builder::register_nb_commit_in_module(module);
+    builder::register_nb_commit_without_proof_in_module(module);
     builder::register_nb_apply_delta_in_module(module);
     builder::register_nb_apply_diff_in_module(module);
     layer::register_node_and_value_count_in_module(module);

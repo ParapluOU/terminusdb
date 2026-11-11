@@ -3030,7 +3030,12 @@ create_graph_from_json(Store, Graph_ID, JSON_Stream, Type, Layer) :-
 
     write_json_stream_to_builder(JSON_Stream, Builder, Type),
     % commit this builder to a temporary layer to perform a diff.
-    nb_commit(Builder,Layer),
+    % The system graph is never proven, so it is committed without proof state.
+    (   (   system_instance_name(Graph_ID)
+        ;   system_schema_name(Graph_ID))
+    ->  nb_commit_without_proof(Builder,Layer)
+    ;   nb_commit(Builder,Layer)
+    ),
     validate_created_graph(Type, Layer),
     nb_set_head(Graph_Obj, Layer).
 
