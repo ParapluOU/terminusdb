@@ -19,6 +19,15 @@ use terminus_store::proof::query::{
     verify_layer_graph_pattern2,
 };
 use terminus_store::store::sync::open_sync_memory_store;
+use terminus_store::storage::ProofStateMode;
+
+/// Proving is opt-in in the store: writing per-layer proof state is off unless
+/// a process sets `TERMINUSDB_PROOF_STATE=on` or a store asks for it. A proof
+/// test asks for it, so it never depends on the environment it runs in.
+fn proving_memory_store() -> terminus_store::store::sync::SyncStore {
+    open_sync_memory_store().with_proof_state(ProofStateMode::On)
+}
+
 
 use dory_pcs::backends::arkworks::ArkFr;
 use dory_pcs::primitives::arithmetic::Field;
@@ -32,7 +41,7 @@ fn iri(suffix: &str) -> String {
 /// Build + commit a base layer of node triples through terminusdb's store stack,
 /// returning its authenticated per-layer commitment.
 fn build_layer(triples: &[(&str, &str, &str)]) -> Arc<LayerCommitment> {
-    let store = open_sync_memory_store();
+    let store = proving_memory_store();
     let builder = store.create_base_layer().unwrap();
     for (s, p, o) in triples {
         builder

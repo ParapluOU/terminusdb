@@ -2,6 +2,23 @@ use tdb_succinct::TdbDataType;
 use terminus_store::proof::query::CanonicalResultValue;
 use terminus_store::proof::CanonicalObject;
 use terminus_store::store::sync::{open_sync_archive_store, open_sync_memory_store};
+use terminus_store::storage::ProofStateMode;
+
+/// Proving is opt-in in the store: writing per-layer proof state is off unless
+/// a process sets `TERMINUSDB_PROOF_STATE=on` or a store asks for it. A proof
+/// test asks for it, so it never depends on the environment it runs in.
+fn proving_memory_store() -> terminus_store::store::sync::SyncStore {
+    open_sync_memory_store().with_proof_state(ProofStateMode::On)
+}
+
+/// The same, for an on-disk store (see `proving_memory_store`).
+fn proving_archive_store(
+    path: impl Into<std::path::PathBuf>,
+    cache_size: usize,
+) -> terminus_store::store::sync::SyncStore {
+    open_sync_archive_store(path, cache_size).with_proof_state(ProofStateMode::On)
+}
+
 use terminus_store::{Layer, ValueTriple};
 use terminusdb_query_proof::{
     compile, compile_json, decode_and_verify_compact_envelope, decode_and_verify_envelope,
@@ -43,7 +60,7 @@ fn predicate_triple(subject: &str, predicate: &str, object: &str) -> Query {
 
 #[test]
 fn owned_cpu_prover_matches_the_cpu_convenience() {
-    let store = open_sync_memory_store();
+    let store = proving_memory_store();
     let builder = store.create_base_layer().unwrap();
     for (subject, object) in [("a", "b"), ("b", "c")] {
         builder
@@ -119,7 +136,7 @@ fn conflicting_acceleration_features_fail_closed() {
 #[cfg(all(feature = "blitzar-cpu", not(feature = "blitzar-gpu")))]
 #[test]
 fn owned_blitzar_cpu_prover_preserves_envelope_bytes() {
-    let store = open_sync_memory_store();
+    let store = proving_memory_store();
     let builder = store.create_base_layer().unwrap();
     for (subject, object) in [("a", "b"), ("b", "c")] {
         builder
@@ -217,7 +234,7 @@ fn canonical_json_grouped_extrema_proves_and_crosses_execution_boundary() {
         assert!(compile_json(&unknown.to_string()).is_err());
     }
 
-    let store = open_sync_memory_store();
+    let store = proving_memory_store();
     let builder = store.create_base_layer().unwrap();
     for (category, score) in [("c1", 30u32), ("c1", 10), ("c2", 5), ("c2", 20)] {
         builder
@@ -301,7 +318,7 @@ fn prolog_omitted_default_graph_is_canonical_but_unknown_fields_still_fail_close
 
 #[test]
 fn compact_verifier_artifact_is_smaller_than_pf4_for_materialized_data() {
-    let store = open_sync_memory_store();
+    let store = proving_memory_store();
     let builder = store.create_base_layer().unwrap();
     for index in 0..64 {
         builder
@@ -321,7 +338,7 @@ fn compact_verifier_artifact_is_smaller_than_pf4_for_materialized_data() {
 
 #[test]
 fn native_boundary_accepts_predicate_ids_and_rejects_dropped_rows() {
-    let store = open_sync_memory_store();
+    let store = proving_memory_store();
     let builder = store.create_base_layer().unwrap();
     for (subject, predicate, object) in [("a", "knows", "b"), ("c", "likes", "d")] {
         builder
@@ -373,7 +390,7 @@ fn native_boundary_accepts_predicate_ids_and_rejects_dropped_rows() {
 
 #[test]
 fn caller_explicitly_compiles_proves_and_selects_the_trusted_root() {
-    let store = open_sync_memory_store();
+    let store = proving_memory_store();
     let builder = store.create_base_layer().unwrap();
     for (subject, predicate, object) in [
         ("a", "knows", "b"),
@@ -571,7 +588,7 @@ fn caller_explicitly_compiles_proves_and_selects_the_trusted_root() {
 
 #[test]
 fn native_boundary_round_trips_correlated_not_rows() {
-    let store = open_sync_memory_store();
+    let store = proving_memory_store();
     let builder = store.create_base_layer().unwrap();
     for (subject, predicate, object) in [
         ("a", "p", "b"),
@@ -686,7 +703,7 @@ fn native_boundary_round_trips_correlated_not_rows() {
 #[test]
 fn recursive_optional_then_not_envelope_survives_archive_reopen() {
     let directory = tempfile::tempdir().unwrap();
-    let store = open_sync_archive_store(directory.path(), 8);
+    let store = proving_archive_store(directory.path(), 8);
     let builder = store.create_base_layer().unwrap();
     for (subject, predicate, object) in [
         ("a", "p", "b"),
@@ -729,7 +746,7 @@ fn recursive_optional_then_not_envelope_survives_archive_reopen() {
     drop(layer);
     drop(store);
 
-    let reopened = open_sync_archive_store(directory.path(), 8);
+    let reopened = proving_archive_store(directory.path(), 8);
     let reopened_layer = reopened.get_layer_from_id(layer_id).unwrap().unwrap();
     let verified =
         decode_and_verify_envelope(&envelope, &reopened_layer, &compiled, trusted_root).unwrap();

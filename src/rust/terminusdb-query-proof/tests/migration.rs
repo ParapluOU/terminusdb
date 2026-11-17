@@ -2,7 +2,24 @@ use terminus_store::layer::{Layer, ValueTriple};
 use terminus_store::store::sync::{
     open_sync_archive_store, open_sync_memory_store, SyncStoreLayer,
 };
+use terminus_store::storage::ProofStateMode;
 use terminusdb_query_proof::{migrate_legacy_chain, MigrationStatus};
+
+/// Proving is opt-in in the store: writing per-layer proof state is off unless
+/// a process sets `TERMINUSDB_PROOF_STATE=on` or a store asks for it. These
+/// tests migrate chains that are already proven, so they ask for it, rather
+/// than depending on the environment they run in.
+fn proving_memory_store() -> terminus_store::store::sync::SyncStore {
+    open_sync_memory_store().with_proof_state(ProofStateMode::On)
+}
+
+/// The same, for an on-disk store.
+fn proving_archive_store(
+    path: impl Into<std::path::PathBuf>,
+    cache_size: usize,
+) -> terminus_store::store::sync::SyncStore {
+    open_sync_archive_store(path, cache_size).with_proof_state(ProofStateMode::On)
+}
 
 fn base(store: &terminus_store::store::sync::SyncStore, subject: &str) -> SyncStoreLayer {
     let builder = store.create_base_layer().unwrap();
@@ -14,7 +31,7 @@ fn base(store: &terminus_store::store::sync::SyncStore, subject: &str) -> SyncSt
 
 #[test]
 fn exact_layer_migration_is_idempotent_and_never_substitutes_another_layer() {
-    let store = open_sync_memory_store();
+    let store = proving_memory_store();
     let first = base(&store, "http://ex/first");
     let second = base(&store, "http://ex/second");
     let first_root = first.proof_commitment().unwrap().state.commitment_root;
@@ -33,7 +50,7 @@ fn exact_layer_migration_is_idempotent_and_never_substitutes_another_layer() {
 
 #[test]
 fn missing_exact_layer_is_an_explicit_error() {
-    let store = open_sync_memory_store();
+    let store = proving_memory_store();
     let error = migrate_legacy_chain(&store, [u32::MAX; 5]).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
 }
@@ -41,14 +58,14 @@ fn missing_exact_layer_is_an_explicit_error() {
 #[test]
 fn archive_result_survives_reopen() {
     let directory = tempfile::tempdir().unwrap();
-    let store = open_sync_archive_store(directory.path(), 8);
+    let store = proving_archive_store(directory.path(), 8);
     let layer = base(&store, "http://ex/archive");
     let id = layer.name();
     let first = migrate_legacy_chain(&store, id).unwrap();
     drop(layer);
     drop(store);
 
-    let reopened = open_sync_archive_store(directory.path(), 8);
+    let reopened = proving_archive_store(directory.path(), 8);
     let second = migrate_legacy_chain(&reopened, id).unwrap();
     assert_eq!(second.layer_id, id);
     assert_eq!(second.trusted_root, first.trusted_root);
