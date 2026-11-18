@@ -1,5 +1,5 @@
 const { expect } = require('chai')
-const { Agent, info } = require('../lib')
+const { Agent, info, util } = require('../lib')
 
 describe('info_ok', function () {
   let agent
@@ -8,15 +8,20 @@ describe('info_ok', function () {
     agent = new Agent().auth()
   })
 
-  it('responds to /api/ok with success', async function () {
+  it('responds to /api/ok with a ready status', async function () {
     const r = await agent.get('/api/ok')
     expect(r.status).to.equal(200)
-    expect(r.header['content-length']).to.equal('0')
+    expect(r.body).to.have.property('status').that.equals('ready')
   })
 
   it('responds to /api/info with success (git hash matches binary version)', async function () {
     const terminusdbVersion = await info.terminusdbVersion()
     const gitHash = await info.gitHash()
+    // Enterprise withholds storage and version details from anonymous callers,
+    // so authenticate to exercise the full response contract.
+    if (util.enterprise) {
+      agent.auth()
+    }
     const r = await agent.get('/api/info')
     expect(r.status).to.equal(200)
     expect(r.body['api:status']).to.equal('api:success')
@@ -29,5 +34,18 @@ describe('info_ok', function () {
     expect(r.body['api:info'].terminusdb).to.have.property('git_hash').that.equals(gitHash)
     expect(r.body['api:info']).to.have.property('terminusdb_store').that.is.an('object')
     expect(r.body['api:info'].terminusdb_store).to.have.property('version').that.is.a('string').and.lengthOf.greaterThan(0)
+    if (util.enterprise) {
+      expect(r.body['api:info']).to.have.property('enterprise').that.is.an('object')
+    }
+  })
+
+  it('serves GET /llms.txt publicly as text/plain', async function () {
+    // llms.txt is the MCP onboarding doc — it describes how to talk to the
+    // server, never what's in it, so it answers without authentication.
+    const r = await new Agent().get('/llms.txt')
+    expect(r.status).to.equal(200)
+    expect(r.header['content-type']).to.include('text/plain')
+    expect(r.text).to.include('tools/call')
+    expect(r.text).to.include('api/mcp')
   })
 })

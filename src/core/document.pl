@@ -6,6 +6,8 @@
               % json.pl
               idgen_random/2,
               idgen_random/3,
+              idgen_uuid_v7/2,
+              idgen_uuid_v7/3,
               idgen_hash/3,
               idgen_lexical/3,
 
@@ -67,6 +69,9 @@
 
               % schema.pl
               class_subsumed/3,
+              is_simple_class/2,
+              is_subdocument/2,
+              system_frame_class/1,
               class_frame/3,
               class_frame/4,
               all_class_frames/2,
@@ -85,6 +90,7 @@
               % patch.pl
               simple_patch/4,
               patch_cost/2,
+              strip_wire_hints/2,
 
               % normalize.pl
               normalize_document/3,

@@ -1,7 +1,8 @@
 :- module('document/patch',
           [   simple_patch/4,
               diff_op/2,
-              get_dict_or_null/3
+              get_dict_or_null/3,
+              strip_wire_hints/2
           ]).
 
 :- use_module(core(util)).
@@ -15,6 +16,8 @@
 :- use_module(library(plunit)).
 
 :- use_module(library(option)).
+
+:- use_module(core(query/jsonld)).
 
 %
 % simple_patch(+Diff,+JSON,-Success_or_Conflict,+Options) is det.
@@ -115,12 +118,47 @@ pairs_and_conflicts_from_keys([Key|Keys], JSON, Diff,
 % as a stored xsd:decimal rational (e.g. 11r10) and a JSON float (e.g. 1.1)
 % are treated as equal.  Dicts and lists are compared structurally.
 %
+% Typed wire literals carry ^^ as a type hint, not as part of the value.
+strip_typed_literal(V, Bare) :-
+    (   nonvar(V), V = Bare^^_
+    ->  true
+    ;   Bare = V
+    ).
+
+%
+% strip_wire_hints(+Term, -Stripped) is det.
+%
+% Recursively strip ^^ type tags from a patch result.  The tags are parse
+% metadata for storage typing — a patch response is plain JSON, and the
+% response serializer cannot write the compound.  Only used on results
+% that are rendered back to the caller; storage paths keep the tags.
+strip_wire_hints(X, Y) :-
+    (   nonvar(X), X = Bare^^_
+    ->  Y = Bare
+    ;   is_dict(X)
+    ->  dict_pairs(X, Tag, Pairs),
+        maplist([K-V,K-W]>>strip_wire_hints(V,W), Pairs, Pairs1),
+        dict_pairs(Y, Tag, Pairs1)
+    ;   is_list(X)
+    ->  maplist(strip_wire_hints, X, Y)
+    ;   compound(X)   % success(After) / conflict(...) result wrappers
+    ->  X =.. [F|Args],
+        maplist(strip_wire_hints, Args, Args1),
+        Y =.. [F|Args1]
+    ;   Y = X
+    ).
+
 values_equal(V1, V2) :-
+    strip_typed_literal(V1, W1),
+    strip_typed_literal(V2, W2),
+    values_equal_(W1, W2).
+
+values_equal_(V1, V2) :-
     number(V1),
     number(V2),
     !,
     V1 =:= V2.
-values_equal(V1, V2) :-
+values_equal_(V1, V2) :-
     (   is_dict(V1)
     ;   is_dict(V2)
     ;   is_list(V1)
@@ -128,12 +166,70 @@ values_equal(V1, V2) :-
     ),
     !,
     V1 = V2.
-values_equal(V1, V2) :-
+values_equal_(V1, V2) :-
     % Convert both to atoms for comparison
     (   atom(V1) -> A1 = V1 ; atom_string(A1, V1)),
     (   atom(V2) -> A2 = V2 ; atom_string(A2, V2)),
     A1 = A2.
 
+%
+% values_equal(+Value1, +Value2, +Prefixes) is semidet.
+%
+% Compare two values using canonical IRI expansion. Both string/atom
+% values are expanded via prefix_expand/3 using the provided Prefixes
+% context before comparison. Non-string values delegate to
+% values_equal/2.
+%
+values_equal(V1, V2, Prefixes) :-
+    strip_typed_literal(V1, W1),
+    strip_typed_literal(V2, W2),
+    values_equal_(W1, W2, Prefixes).
+
+values_equal_(V1, V2, _Prefixes) :-
+    (   number(V1)
+    ;   number(V2)
+    ;   is_dict(V1)
+    ;   is_dict(V2)
+    ;   is_list(V1)
+    ;   is_list(V2)
+    ),
+    !,
+    values_equal(V1, V2).
+values_equal_(V1, V2, Prefixes) :-
+    (   atom(V1) -> A1 = V1 ; atom_string(A1, V1)),
+    (   atom(V2) -> A2 = V2 ; atom_string(A2, V2)),
+    (   A1 = A2
+    ->  true
+    %   Empty strings are values, not keys — prefix_expand would throw
+    %   empty_key, so only expand when both sides are non-empty.
+    ;   A1 \= '',
+        A2 \= '',
+        prefix_expand(A1, Prefixes, E1),
+        prefix_expand(A2, Prefixes, E2),
+        atom_string(E1, E1_String),
+        atom_string(E2, E2_String),
+        E1_String = E2_String
+    ).
+
+check_before_after(Original, Before, After, Final, Options) :-
+    option(match_final_state(true), Options),
+    option(prefixes(Prefixes), Options),
+    !,
+    (   values_equal(Original, After, Prefixes)
+    ->  Final = success(After)
+    ;   values_equal(Original, Before, Prefixes)
+    ->  Final = success(After)
+    ;   conflict_json(Before, Original, After, Options, Conflict),
+        Final = conflict(Conflict)
+    ).
+check_before_after(Original, Before, After, Final, Options) :-
+    option(prefixes(Prefixes), Options),
+    !,
+    (   values_equal(Original, Before, Prefixes)
+    ->  Final = success(After)
+    ;   conflict_json(Before, Original, After, Options, Conflict),
+        Final = conflict(Conflict)
+    ).
 check_before_after(Original, Before, After, Final, Options) :-
     option(match_final_state(true), Options),
     !,
@@ -141,17 +237,30 @@ check_before_after(Original, Before, After, Final, Options) :-
     ->  Final = success(After)
     ;   values_equal(Original, Before)
     ->  Final = success(After)
-    ;   Final = conflict(json{ '@op' : 'Conflict',
-                               '@expected' : Before,
-                               '@found' : Original })
+    ;   conflict_json(Before, Original, After, Options, Conflict),
+        Final = conflict(Conflict)
     ).
-check_before_after(Original, Before, After, Final, _Options) :-
+check_before_after(Original, Before, After, Final, Options) :-
     (   values_equal(Original, Before)
     ->  Final = success(After)
-    ;   Final = conflict(json{ '@op' : 'Conflict',
-                               '@expected' : Before,
-                               '@found' : Original })
+    ;   conflict_json(Before, Original, After, Options, Conflict),
+        Final = conflict(Conflict)
     ).
+
+% conflict_json(+Before, +Original, +After, +Options, -Conflict) is det.
+%
+%  '@incoming' names the value the diff was carrying (the source side of
+%  a merge). Opt-in via conflict_incoming(true) — bare callers get the
+%  historical two-value witness.
+conflict_json(Before, Original, After, Options, Conflict) :-
+    (   option(conflict_incoming(true), Options)
+    ->  Conflict = json{ '@op' : 'Conflict',
+                         '@expected' : Before,
+                         '@found' : Original,
+                         '@incoming' : After }
+    ;   Conflict = json{ '@op' : 'Conflict',
+                         '@expected' : Before,
+                         '@found' : Original }).
 
 non_conflict_list(List, Conflict) :-
     maplist([_,null]>>true, List, Conflict).
@@ -1087,6 +1196,20 @@ test(values_equal_float_and_integer, []) :-
 test(values_equal_integer_and_decimal, []) :-
     values_equal(1, 1r1).
 
+test(strip_wire_hints_deep, []) :-
+    %% Every arm: ^^ literals (incl. high-precision rational), dicts,
+    %% lists, result wrappers, plain scalars.
+    In = success(_{ a : 11r10^^'xsd:decimal',
+                    b : [ 987654321098765432109r100000000000000000000^^'xsd:decimal',
+                          "s", 3 ],
+                    c : conflict(_{ d : 1r3^^'xsd:decimal' }) }),
+    strip_wire_hints(In, Out),
+    Out = success(_{ a : 11r10,
+                     b : [ R, "s", 3 ],
+                     c : conflict(_{ d : 1r3 }) }),
+    %% High-precision rational survives stripping unchanged.
+    R =:= 9.87654321098765432109.
+
 test(swap_decimal_value, []) :-
     %% Regression: patching a decimal property with a float SwapValue
     %% must not produce a conflict when the stored value is equal.
@@ -1114,7 +1237,113 @@ test(swap_decimal_value_json_preserve, []) :-
                 weight : 11r10 },
     simple_patch(Patch, Before, success(_{ '@id' : "Test/1",
                                              '@type' : "Test",
-                                             weight : 6r5 }), []).
+                                             weight : 6r5^^'http://www.w3.org/2001/XMLSchema#decimal' }), []).
+
+test(swapvalue_empty_before_against_empty, []) :-
+    Before = _{ '@id' : "Task/1",
+                '@type' : "Task",
+                notes : ""
+              },
+    Patch = _{ notes : _{ '@op' : "SwapValue",
+                          '@before' : "",
+                          '@after' : "first note" }
+             },
+    After =  _{ '@id' : "Task/1",
+                '@type' : "Task",
+                notes : "first note"
+              },
+    simple_patch(Patch, Before, success(After),
+                 _{ prefixes : _{ '@base' : "http://somewhere.for.now/document/" } }).
+
+test(swapvalue_empty_before_against_nonempty_conflicts, []) :-
+    Before = _{ '@id' : "Task/1",
+                '@type' : "Task",
+                notes : "existing"
+              },
+    Patch = _{ notes : _{ '@op' : "SwapValue",
+                          '@before' : "",
+                          '@after' : "overwrite" }
+             },
+    simple_patch(Patch, Before, conflict(Conflict),
+                 _{ prefixes : _{ '@base' : "http://somewhere.for.now/document/" } }),
+    Conflict = json{ notes : json{ '@expected' : "",
+                                   '@found' : "existing",
+                                   '@op' : 'Conflict' } }.
+
+test(force_value_flips_unconditionally, []) :-
+    Before = _{ '@id' : "Task/1",
+                '@type' : "Task",
+                notes : "anything"
+              },
+    Patch = _{ notes : _{ '@op' : "ForceValue",
+                          '@after' : "flipped" }
+             },
+    After =  _{ '@id' : "Task/1",
+                '@type' : "Task",
+                notes : "flipped"
+              },
+    simple_patch(Patch, Before, success(After), []).
+
+test(force_value_sets_missing_key, []) :-
+    Before = _{ '@id' : "Task/1",
+                '@type' : "Task"
+              },
+    Patch = _{ notes : _{ '@op' : "ForceValue",
+                          '@after' : "set" }
+             },
+    After =  _{ '@id' : "Task/1",
+                '@type' : "Task",
+                notes : "set"
+              },
+    simple_patch(Patch, Before, success(After), []).
 
 :- end_tests(simple_patch).
+
+:- begin_tests(values_equal_canonical).
+
+test(same_compressed_id, []) :-
+    Prefixes = _{ '@base' : "http://somewhere.for.now/document/" },
+    values_equal("Person/Bob", "Person/Bob", Prefixes).
+
+test(compressed_vs_expanded, []) :-
+    Prefixes = _{ '@base' : "http://somewhere.for.now/document/" },
+    values_equal("Person/Bob", "http://somewhere.for.now/document/Person/Bob", Prefixes).
+
+test(expanded_vs_compressed, []) :-
+    Prefixes = _{ '@base' : "http://somewhere.for.now/document/" },
+    values_equal("http://somewhere.for.now/document/Person/Bob", "Person/Bob", Prefixes).
+
+test(both_expanded, []) :-
+    Prefixes = _{ '@base' : "http://somewhere.for.now/document/" },
+    values_equal("http://somewhere.for.now/document/Person/Bob",
+                 "http://somewhere.for.now/document/Person/Bob", Prefixes).
+
+test(different_ids_not_equal, []) :-
+    Prefixes = _{ '@base' : "http://somewhere.for.now/document/" },
+    \+ values_equal("Person/Bob", "Person/Alice", Prefixes).
+
+test(no_prefixes_fallback, []) :-
+    values_equal("Person/Bob", "Person/Bob", _{}).
+
+test(number_comparison_with_prefixes, []) :-
+    Prefixes = _{ '@base' : "http://somewhere.for.now/document/" },
+    values_equal(1.1, 11r10, Prefixes).
+
+test(dict_comparison_with_prefixes, []) :-
+    Prefixes = _{ '@base' : "http://somewhere.for.now/document/" },
+    values_equal(json{x:1}, json{x:1}, Prefixes).
+
+test(empty_string_equal, []) :-
+    Prefixes = _{ '@base' : "http://somewhere.for.now/document/" },
+    values_equal("", "", Prefixes).
+
+test(empty_atom_vs_empty_string, []) :-
+    Prefixes = _{ '@base' : "http://somewhere.for.now/document/" },
+    values_equal('', "", Prefixes).
+
+test(empty_vs_nonempty_not_equal, []) :-
+    Prefixes = _{ '@base' : "http://somewhere.for.now/document/" },
+    \+ values_equal("", "x", Prefixes).
+
+:- end_tests(values_equal_canonical).
 

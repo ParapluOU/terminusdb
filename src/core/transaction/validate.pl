@@ -212,7 +212,12 @@ commit_validation_object(Validation_Object, []) :-
     storage(Store),
     (   validation_object_changed(Instance_Object)
     ->  safe_open_named_graph(Store, Instance_Label, Instance_Graph),
-        nb_set_head(Instance_Graph, Instance_Object.read)
+        (   expected_label_version(Instance_Label, Expected_Version, Guard_Desc, Guard_Req)
+        ->  retractall(data_version:expected_label_version(Instance_Label, _, _, _)),
+            (   nb_force_set_head(Instance_Graph, Instance_Object.read, Expected_Version)
+            ->  true
+            ;   throw_data_version_cas_lost(Guard_Desc, Guard_Req))
+        ;   nb_set_head(Instance_Graph, Instance_Object.read))
     ;   true),
     (   validation_object_changed(Schema_Object)
     ->  safe_open_named_graph(Store, Schema_Label, Schema_Graph),
@@ -250,7 +255,12 @@ commit_validation_object(Validation_Object, []) :-
     (   validation_object_changed(Instance_Object)
     ->  storage(Store),
         safe_open_named_graph(Store, Instance_Label, Instance_Graph),
-        nb_set_head(Instance_Graph, Instance_Object.read)
+        (   expected_label_version(Instance_Label, Expected_Version, Guard_Desc, Guard_Req)
+        ->  retractall(data_version:expected_label_version(Instance_Label, _, _, _)),
+            (   nb_force_set_head(Instance_Graph, Instance_Object.read, Expected_Version)
+            ->  true
+            ;   throw_data_version_cas_lost(Guard_Desc, Guard_Req))
+        ;   nb_set_head(Instance_Graph, Instance_Object.read))
     ;   true),
     (   validation_object_changed(Schema_Object)
     ->  storage(Store),
@@ -275,7 +285,12 @@ commit_validation_object(Validation_Object, []) :-
     (   validation_object_changed(Instance_Object)
     ->  storage(Store),
         safe_open_named_graph(Store, Instance_Label, Instance_Graph),
-        nb_set_head(Instance_Graph, Instance_Object.read)
+        (   expected_label_version(Instance_Label, Expected_Version, Guard_Desc, Guard_Req)
+        ->  retractall(data_version:expected_label_version(Instance_Label, _, _, _)),
+            (   nb_force_set_head(Instance_Graph, Instance_Object.read, Expected_Version)
+            ->  true
+            ;   throw_data_version_cas_lost(Guard_Desc, Guard_Req))
+        ;   nb_set_head(Instance_Graph, Instance_Object.read))
     ;   true).
 commit_validation_object(Validation_Object, []) :-
     validation_object{
@@ -295,7 +310,12 @@ commit_validation_object(Validation_Object, []) :-
         % therefore we can just open it
         organization_database_name(Organization_Name, Database_Name, Composite),
         safe_open_named_graph(Store, Composite, Graph),
-        nb_set_head(Graph, Instance_Object.read)
+        (   expected_label_version(Composite, Expected_Version, Guard_Desc, Guard_Req)
+        ->  retractall(data_version:expected_label_version(Composite, _, _, _)),
+            (   nb_force_set_head(Graph, Instance_Object.read, Expected_Version)
+            ->  true
+            ;   throw_data_version_cas_lost(Guard_Desc, Guard_Req))
+        ;   nb_set_head(Graph, Instance_Object.read))
     ;   true).
 commit_validation_object(Validation_Object, [Parent_Transaction]) :-
     validation_object{

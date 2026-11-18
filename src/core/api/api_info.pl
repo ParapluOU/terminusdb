@@ -4,11 +4,26 @@
 :- use_module(core(triple)).
 :- use_module(config(terminus_config), [terminusdb_version/1,
                                         is_memory_mode/0,
-                                        is_enterprise/0]).
+                                        is_enterprise/0,
+                                        indexer_backend/1]).
 
 :- use_module(library(terminus_store), [terminus_store_version/1]).
 
+% indexer_available/0 is a semidet predicate exported by plugin_api.
+% It succeeds when the Rust indexer FFI predicates are registered.
+% indexer_endpoint_available/0 and indexer_tokenizer_available/1 delegate
+% to the vectorlink plugin (probe-cached at most once a second) so info
+% never hammers the endpoint. We use autoload instead of explicit
+% import to avoid load-order issues.
+:- autoload(core(plugin_api), [indexer_available/0,
+                               indexer_endpoint_available/0,
+                               indexer_tokenizer_available/1]).
+
 info(_System_DB, Auth, Info) :-
+
+    % Community serves the full info payload to any caller, anonymous
+    % included; enterprise redacts for anonymous instead.
+
     terminusdb_version(TerminusDB_Version),
     terminus_store_version(TerminusDB_Store_Version),
     current_prolog_flag(terminusdb_git_hash, Git_Hash),
@@ -21,11 +36,13 @@ info(_System_DB, Auth, Info) :-
     server_edition(Edition),
     http_engine(Http_Engine),
 
+    indexer_info(Indexer_Info),
     (   is_anonymous_authority(Auth)
     ->  Info = _{
                authority: Auth,
                edition: Edition,
                http_engine: Http_Engine,
+               indexer: Indexer_Info,
                storage:
                _{
                    version: Storage_Version_String
@@ -35,6 +52,7 @@ info(_System_DB, Auth, Info) :-
                authority: Auth,
                edition: Edition,
                http_engine: Http_Engine,
+               indexer: Indexer_Info,
                terminusdb :
                _{
                    version : TerminusDB_Version,
@@ -78,6 +96,46 @@ http_engine(Engine) :-
     ;   Engine = metal
     ).
 
+%% indexer_info(-Info) is det.
+%
+%  Reports the indexer backend configuration and availability.
+%  - backend: the configured backend atom (none, http_vectorlink, http_legacy_vectorlink)
+%  - configured: true when backend is not 'none'
+%  - available: true when the Rust indexer FFI predicates are registered
+%    (i.e. the indexer runtime is loaded and operational)
+%  - endpoint_available: an OpenAI-compatible endpoint answered the last
+%    probe (cached, at most one probe per second) — what boot detection
+%    keyed on. Boot-only for now; re-probing later is a naming-compatible
+%    change.
+%  - tokenizer_available: a tokenizer file the embedded engine can load
+%    is present (env-pinned or shipped asset)
+indexer_info(Info) :-
+    (   catch(indexer_backend(Backend), _, Backend = none)
+    ->  true
+    ;   Backend = none
+    ),
+    (   Backend \= none
+    ->  Configured = true
+    ;   Configured = false
+    ),
+    (   Configured = true,
+        catch(indexer_available, _, fail)
+    ->  Available = true
+    ;   Available = false
+    ),
+    (   catch(indexer_endpoint_available, _, fail)
+    ->  Endpoint_Available = true
+    ;   Endpoint_Available = false
+    ),
+    catch(indexer_tokenizer_available(Tokenizer_Available), _, false),
+    Info = _{
+        backend: Backend,
+        configured: Configured,
+        available: Available,
+        endpoint_available: Endpoint_Available,
+        tokenizer_available: Tokenizer_Available
+    }.
+
 %% is_anonymous_authority(+Auth) is semidet.
 %
 %  True when Auth is the anonymous user authority, i.e. the request was
@@ -91,7 +149,8 @@ is_anonymous_authority(doc:anonymous) :- !.
 :- use_module(core(util/test_utils)).
 :- use_module(core(triple/constants), [super_user_authority/1]).
 :- use_module(config(terminus_config), [set_memory_mode/0,
-                                        is_memory_mode/0]).
+                                        is_memory_mode/0,
+                                        is_enterprise/0]).
 
 % server_edition/1 is pure logic over the terminusdb_enterprise flag.
 % It reports the atom `community` for the open source build and
@@ -141,6 +200,29 @@ test(is_anonymous_authority_uri) :-
 test(is_not_anonymous_authority_for_admin) :-
     \+ is_anonymous_authority('terminusdb://system/data/User/admin').
 
+% indexer_info/1 always produces a dict with backend, configured, and available.
+test(indexer_info_produces_dict) :-
+    indexer_info(Info),
+    get_dict(backend, Info, _),
+    get_dict(configured, Info, _),
+    get_dict(available, Info, _).
+
+% Detection feedback: the info block names what the boot probe saw, so
+% an agent can tell an unreachable endpoint from a missing tokenizer.
+test(indexer_info_reports_endpoint_and_tokenizer) :-
+    indexer_info(Info),
+    get_dict(endpoint_available, Info, _),
+    get_dict(tokenizer_available, Info, _).
+
+% indexer_info/1 reports configured=false when backend is none.
+test(indexer_info_none_backend_not_configured,
+     [setup(terminus_config:clear_indexer_backend_config),
+      cleanup(terminus_config:clear_indexer_backend_config)]) :-
+    indexer_info(Info),
+    get_dict(backend, Info, Backend),
+    Backend == none,
+    get_dict(configured, Info, false).
+
 % info/3 for a logged-in user includes all sections.
 test(info_logged_in_includes_all_sections,
      [setup((setup_temp_store(State),
@@ -153,13 +235,16 @@ test(info_logged_in_includes_all_sections,
     get_dict(authority, Info, Auth),
     get_dict(edition, Info, _),
     get_dict(http_engine, Info, _),
+    get_dict(indexer, Info, _),
     get_dict(terminusdb, Info, _),
     get_dict(terminusdb_store, Info, _),
     get_dict(storage, Info, _).
 
-% info/3 for an anonymous user omits terminusdb and terminusdb_store.
+% info/3 for an anonymous user omits terminusdb and terminusdb_store
+% but still includes the indexer section.
 test(info_anonymous_omits_version_sections,
-     [setup((setup_temp_store(State),
+     [condition(\+ is_enterprise),
+      setup((setup_temp_store(State),
              set_memory_mode)),
       cleanup((terminus_config:retractall(memory_mode_enabled),
                teardown_temp_store(State)))
@@ -168,6 +253,7 @@ test(info_anonymous_omits_version_sections,
     get_dict(authority, Info, 'terminusdb://system/data/User/anonymous'),
     get_dict(edition, Info, _),
     get_dict(http_engine, Info, _),
+    get_dict(indexer, Info, _),
     get_dict(storage, Info, _),
     \+ get_dict(terminusdb, Info, _),
     \+ get_dict(terminusdb_store, Info, _).

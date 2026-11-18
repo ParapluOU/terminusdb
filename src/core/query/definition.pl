@@ -330,6 +330,20 @@ definition(
         types: [collection,decimal]
     }).
 definition(
+    triple_count{
+        name: 'TripleCount',
+        fields: [subject,predicate,object,count,optional(graph)],
+        mode: [?,?,?,?,+],
+        types: [node,node,value,decimal,graph]
+    }).
+definition(
+    triple_range_count{
+        name: 'TripleRangeCount',
+        fields: [subject,predicate,low,high,count,optional(graph)],
+        mode: [?,?,+,+,?,+],
+        types: [node,node,value,value,decimal,graph]
+    }).
+definition(
     size{
         name: 'Size',
         fields: [resource,size],
@@ -463,6 +477,13 @@ definition(
         fields: [relation,x,y],
         mode: [?,+,+],
         types: [data_value,data_value,data_value]
+    }).
+definition(
+    triple_relation{
+        name: 'TripleRelation',
+        fields: [subject,predicate,object,relation,value],
+        mode: [?,?,?,+,+],
+        types: [node,node,data_value,data_value,data_value]
     }).
 definition(
     weekday{
@@ -688,6 +709,13 @@ definition(
         mode: [+, +, ?],
         types: [string, list(string), node]
     }).
+definition(
+    idgen_uuid_v7{
+        name: 'UuidV7',
+        fields: [base, key_list, uri],
+        mode: [+, +, ?],
+        types: [string, list(string), node]
+    }).
 
 /* types */
 definition(
@@ -707,9 +735,9 @@ definition(
 definition(
     typecast{
         name: 'Typecast',
-        fields: [value,type,result],
-        mode:  [+,+,?],
-        types: [value,node,value]
+        fields: [value,type,result,optional(prefixes)],
+        mode:  [+,+,?,+],
+        types: [value,node,value,json]
     }).
 definition(
     typeof{
@@ -806,6 +834,7 @@ operator(month_start_dates(_,_,_)).
 operator(month_end_dates(_,_,_)).
 operator(interval_relation(_,_,_,_,_)).
 operator(interval_relation_typed(_,_,_)).
+operator(triple_relation(_,_,_,_,_)).
 operator(weekday(_,_)).
 operator(weekday_sunday_start(_,_)).
 operator(iso_week(_,_,_)).
@@ -829,7 +858,12 @@ operator(timestamp_now(_)).
 operator(idgen(_,_,_)).
 operator(hash(_,_,_)).
 operator(idgen_random(_,_,_)).
+operator(idgen_uuid_v7(_,_,_)).
 operator(triple_count(_,_)).
+operator(triple_count(_,_,_,_)).
+operator(triple_count(_,_,_,_,_)).
+operator(triple_range_count(_,_,_,_,_)).
+operator(triple_range_count(_,_,_,_,_,_)).
 operator(size(_,_)).
 
 cost(Term, Cost) :-
@@ -1386,6 +1420,9 @@ cost_(day_before(_,_), Cost, _Polarity) =>
     Cost = 1.
 
 cost_(typecast(_,_,_), Cost, _Polarity) =>
+    Cost = 1.
+
+cost_(typecast(_,_,_,_), Cost, _Polarity) =>
     Cost = 1.
 
 cost_(typeof(_,_), Cost, _Polarity) =>

@@ -47,7 +47,12 @@ fn get_process_rss_bytes() -> Option<usize> {
     unsafe {
         let mut info: MachTaskBasicInfo = std::mem::zeroed();
         let mut count = MACH_TASK_BASIC_INFO_COUNT;
-        let result = task_info(mach_task_self(), MACH_TASK_BASIC_INFO, &mut info, &mut count);
+        let result = task_info(
+            mach_task_self(),
+            MACH_TASK_BASIC_INFO,
+            &mut info,
+            &mut count,
+        );
         if result == 0 {
             Some(info.resident_size as usize)
         } else {
@@ -81,26 +86,26 @@ fn get_process_rss_bytes() -> Option<usize> {
 predicates! {
     pub semidet fn open_memory_store(context, term) {
         let store = open_sync_memory_store().with_proof_state(context.try_or_die(ProofStateMode::from_env())?);
-        term.unify(&WrappedStore(store))
+        term.unify(WrappedStore(store))
     }
 
     pub semidet fn open_directory_store(context, dir_term, out_term) {
         let dir: PrologText = dir_term.get_ex()?;
         let store = open_sync_directory_store(&*dir).with_proof_state(context.try_or_die(ProofStateMode::from_env())?);
-        out_term.unify(&WrappedStore(store))
+        out_term.unify(WrappedStore(store))
     }
 
     pub semidet fn open_raw_archive_store(context, dir_term, out_term) {
         let dir: PrologText = dir_term.get_ex()?;
         let store = open_sync_raw_archive_store(&*dir).with_proof_state(context.try_or_die(ProofStateMode::from_env())?);
-        out_term.unify(&WrappedStore(store))
+        out_term.unify(WrappedStore(store))
     }
 
     pub semidet fn open_archive_store(context, dir_term, cache_size_term, out_term) {
         let dir: PrologText = dir_term.get_ex()?;
         let cache_size: usize = cache_size_term.get_ex::<u64>()? as usize;
         let store = open_sync_archive_store(&*dir, cache_size).with_proof_state(context.try_or_die(ProofStateMode::from_env())?);
-        out_term.unify(&WrappedStore(store))
+        out_term.unify(WrappedStore(store))
     }
 
     pub semidet fn open_grpc_store(context, dir_term, address_term, initial_pool_term, cache_size_term, out_term) {
@@ -121,7 +126,7 @@ predicates! {
             .with_lru_evict(move |fraction| lru_evict_ref.evict_to_target(fraction))
             .with_proof_state(context.try_or_die(ProofStateMode::from_env())?));
 
-        out_term.unify(&WrappedStore(store))
+        out_term.unify(WrappedStore(store))
     }
 
     pub semidet fn open_write(context, store_or_graph_or_layer_term, builder_term) {
@@ -199,7 +204,12 @@ predicates! {
         layer_parents_term.unify(result_terms.as_slice())
     }
 
-    pub semidet fn pack_import(context, store_term, layer_ids_term, pack_term) {
+    /// Import the given layers from the pack into the store.
+    ///
+    /// Layers that already exist are not overwritten; their contents
+    /// are verified against the pack instead, and the list of
+    /// mismatched layer ids is unified with the last argument.
+    pub semidet fn pack_import(context, store_term, layer_ids_term, pack_term, mismatched_term) {
         let store: WrappedStore = store_term.get_ex()?;
 
         let layer_id_strings: Vec<String> = layer_ids_term.get_ex()?;
@@ -211,7 +221,26 @@ predicates! {
 
         let pack: Vec<u8> = pack_term.get_ex()?;
 
-        context.try_or_die(store.import_layers(pack.as_slice(), Box::new(layer_ids.into_iter())))
+        // The fork's import is fail-closed: a layer whose files or proof state
+        // differ from the pack rejects the whole import before anything becomes
+        // visible, rather than being reported back as "mismatched" for the
+        // caller to deal with. So on success the mismatch list is always empty,
+        // and the predicate keeps its arity for the Prolog side.
+        context.try_or_die(store.import_layers(pack.as_slice(), Box::new(layer_ids.into_iter())))?;
+        let mismatched_strings: Vec<String> = Vec::new();
+
+        mismatched_term.unify(mismatched_strings.as_slice())
+    }
+
+    /// Create an empty base layer with the given name in this store.
+    ///
+    /// Fails if a layer with this name already exists.
+    pub semidet fn create_empty_base_layer(context, store_term, layer_id_term) {
+        let store: WrappedStore = store_term.get_ex()?;
+        let layer_id_string: String = layer_id_term.get_ex()?;
+        let name = context.try_or_die(string_to_name(&layer_id_string))?;
+
+        context.try_or_die(store.create_named_base_layer(name))
     }
 
     pub semidet fn merge_base_layers(context, store_term, temp_dir_term, layer_ids_term, output_id_term) {

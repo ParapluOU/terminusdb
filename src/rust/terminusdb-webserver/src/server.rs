@@ -1,14 +1,83 @@
+use axum::extract::Request;
+use axum::middleware::Next;
 use axum::{
+    extract::DefaultBodyLimit,
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
 use serde_json::json;
 use std::net::SocketAddr;
-use tower_http::cors::{Any, CorsLayer};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::config::MAX_BODY_SIZE;
 use crate::routes::root_redirect;
+
+/// Global counter for active HTTP connections.
+static ACTIVE_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Readiness flag reported by `/api/v1/health`. Prolog publishes `false`
+/// before the socket accepts and `true` once post-startup hooks and
+/// every registered readiness component have completed. Defaults to
+/// `true` so hosts that never publish (unit tests, embedders) keep the
+/// historical always-200 response.
+static SERVER_READY: AtomicBool = AtomicBool::new(true);
+
+/// Set the server readiness flag.
+pub fn set_ready(ready: bool) {
+    SERVER_READY.store(ready, Ordering::SeqCst);
+}
+
+/// Current server readiness flag.
+pub fn is_ready() -> bool {
+    SERVER_READY.load(Ordering::SeqCst)
+}
+
+/// Get the current number of active connections.
+pub fn active_connections() -> u64 {
+    ACTIVE_CONNECTIONS.load(Ordering::SeqCst)
+}
+
+/// Middleware that tracks active connections by incrementing on entry
+/// and decrementing when the response completes.
+async fn connection_counter_middleware(req: Request, next: Next) -> impl IntoResponse {
+    ACTIVE_CONNECTIONS.fetch_add(1, Ordering::SeqCst);
+    let resp = next.run(req).await;
+    ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+    resp
+}
+
+/// Middleware that intercepts Axum's default 405 Method Not Allowed responses
+/// (which have an empty body) and replaces them with a standardized JSON-LD
+/// error response matching the Prolog backend's format.
+async fn method_not_allowed_middleware(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let response = next.run(req).await;
+    if response.status() == StatusCode::METHOD_NOT_ALLOWED {
+        let allow = response.headers().get(axum::http::header::ALLOW).cloned();
+        let body = Json(json!({
+            "@type": "api:MethodNotAllowedErrorResponse",
+            "api:status": "api:method_not_allowed",
+            "api:message": format!("HTTP method {} is not allowed for {}", method, path),
+            "api:error": {
+                "@type": "api:MethodNotAllowed",
+                "api:method": method.as_str().to_uppercase(),
+                "api:path": path
+            }
+        }));
+        let mut new_response = (StatusCode::METHOD_NOT_ALLOWED, body).into_response();
+        if let Some(allow) = allow {
+            new_response
+                .headers_mut()
+                .insert(axum::http::header::ALLOW, allow);
+        }
+        new_response
+    } else {
+        response
+    }
+}
 
 /// Build the Axum application router.
 ///
@@ -18,17 +87,28 @@ pub fn app() -> Router {
     Router::new()
         .route("/", get(root_redirect))
         .route("/api/v1/health", get(health_handler))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
+}
+
+/// Health-check response for a given readiness state.
+///
+/// Responds immediately: 200 {"status":"ready"} once startup has fully
+/// completed, 503 {"status":"starting"} while the server is still
+/// initializing — a real readiness signal for probes instead of racing
+/// subsystems that are still coming up.
+fn health_response(ready: bool) -> (StatusCode, Json<serde_json::Value>) {
+    if ready {
+        (StatusCode::OK, Json(json!({"status": "ready"})))
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "starting"})),
         )
+    }
 }
 
 /// Health-check handler.
-async fn health_handler() -> Json<serde_json::Value> {
-    Json(json!({"status": "ok"}))
+async fn health_handler() -> impl IntoResponse {
+    health_response(is_ready())
 }
 
 /// Fallback handler for unmatched routes.
@@ -93,11 +173,8 @@ pub fn start_with_routes(
         // default backlog (128 on macOS) is too small for high connection
         // counts — 30000 simultaneous connections overflow the accept
         // queue and drop ~50% of connections.
-        let socket = match socket2::Socket::new(
-            socket2::Domain::IPV4,
-            socket2::Type::STREAM,
-            None,
-        ) {
+        let socket = match socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+        {
             Ok(s) => s,
             Err(e) => {
                 tx.send(Err(format!(
@@ -133,11 +210,8 @@ pub fn start_with_routes(
         // On macOS with somaxconn=128, this still helps because the kernel
         // may use a higher internal queue.
         if let Err(e) = socket.listen(65535) {
-            tx.send(Err(format!(
-                "failed to listen on port {}: {}",
-                port, e
-            )))
-            .ok();
+            tx.send(Err(format!("failed to listen on port {}: {}", port, e)))
+                .ok();
             return;
         }
 
@@ -163,7 +237,8 @@ pub fn start_with_routes(
                 runtime
             }
             Err(e) => {
-                tx.send(Err(format!("failed to create tokio runtime: {}", e))).ok();
+                tx.send(Err(format!("failed to create tokio runtime: {}", e)))
+                    .ok();
                 return;
             }
         };
@@ -176,7 +251,10 @@ pub fn start_with_routes(
                 .merge(plugin_router)
                 .merge(static_router)
                 .merge(stream_router)
-                .fallback(fallback_not_found);
+                .fallback(fallback_not_found)
+                .layer(DefaultBodyLimit::max(*MAX_BODY_SIZE))
+                .layer(axum::middleware::from_fn(method_not_allowed_middleware))
+                .layer(axum::middleware::from_fn(connection_counter_middleware));
             let tokio_listener = match tokio::net::TcpListener::from_std(listener) {
                 Ok(listener) => listener,
                 Err(e) => {
@@ -198,7 +276,8 @@ pub fn start_with_routes(
         });
     });
 
-    rx.recv().map_err(|e| format!("webserver startup channel closed: {}", e))?
+    rx.recv()
+        .map_err(|e| format!("webserver startup channel closed: {}", e))?
 }
 
 #[cfg(test)]
@@ -215,11 +294,30 @@ mod tests {
         let app = app();
         let response = app
             .clone()
-            .oneshot(Request::builder().uri("/api/v1/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn health_response_ready_reports_ready() {
+        let (status, Json(body)) = health_response(true);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ready");
+    }
+
+    #[test]
+    fn health_response_starting_reports_503() {
+        let (status, Json(body)) = health_response(false);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "starting");
     }
 
     #[tokio::test]
@@ -232,8 +330,13 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
         assert_eq!(
-            response.headers().get("location").unwrap().to_str().unwrap(),
-            "/app/alpha"
+            response
+                .headers()
+                .get("location")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "/app/admin"
         );
     }
 
@@ -241,12 +344,19 @@ mod tests {
     async fn fallback_returns_api_not_found() {
         let app = app().fallback(fallback_not_found);
         let response = app
-            .oneshot(Request::builder().uri("/api/unknown").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/unknown")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["api:status"], "api:not_found");
         assert_eq!(json["api:path"], "/api/unknown");

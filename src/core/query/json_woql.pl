@@ -3,7 +3,8 @@
               initialise_woql_contexts/0,
               json_woql/2,
               json_woql_path_element_error_message/4,
-              json_value_cast_type/3
+              json_value_cast_type/3,
+              json_value_cast_type/4
           ]).
 
 /** <module> WOQL JSON-LD syntax
@@ -72,25 +73,33 @@ is_float_or_double_type(Type) :-
                   'xsd:double']).
 
 json_value_cast_type(V,Type,WOQL) :-
-    default_prefixes(Default_Prefixes),
-    prefix_expand(Type, Default_Prefixes, TE),
-    (   string(V)
+    json_value_cast_type(V,Type,[],WOQL).
+
+json_value_cast_type(V,Type,Hint,WOQL) :-
+    % Type names expand against the global defaults — the same bindings the
+    % old dict round-trip produced, without a per-call FFI.
+    default_type_expand(Type, TE),
+    (   nonvar(V), V = _^^_
+    ->  % Pre-typed value (e.g. 1^^xsd:decimal from the wire) - cast
+        % from its declared type; recasts freely to other targets.
+        typecast(V, TE, Hint, Val)
+    ;   string(V)
     ->  typecast(V^^xsd:string,
-                 TE, [], Val)
+                 TE, Hint, Val)
     ;   atom(V),
         atom_string(V,String)
     ->  typecast(String^^xsd:string,
-                 TE, [], Val)
+                 TE, Hint, Val)
     ;   integer(V)
     ->  % CRITICAL FIX: Convert integers to floats for xsd:double/xsd:float types
         % This ensures proper string serialization (33.0 not 33)
         (   is_float_or_double_type(TE)
         ->  % Convert to float first, then typecast
             FloatV is float(V),
-            typecast(FloatV^^TE, TE, [], Val)
+            typecast(FloatV^^TE, TE, Hint, Val)
         ;   % Keep integers as integers for operations like limit/offset
             typecast(V^^xsd:decimal,
-                     TE, [], Val)
+                     TE, Hint, Val)
         )
     ;   rational(V),
         \+ integer(V)
@@ -104,10 +113,10 @@ json_value_cast_type(V,Type,WOQL) :-
         % So floats here are actual JSON numbers that already have limited precision
         format(string(Num_String), '~w', [V]),
         typecast(Num_String^^xsd:string,
-                 TE, [], Val)
+                 TE, Hint, Val)
     ;   member(V,[false,true])
     ->  typecast(V^^xsd:boolean,
-                 TE, [], Val)
+                 TE, Hint, Val)
     ;   throw(error(null_unsupported, V))
     ),
     WOQL = Val.
@@ -120,6 +129,11 @@ json_data_to_woql_ast(JSON,WOQL) :-
     ;   _{'@value' : V, '@language' : L } :< JSON
     ->  atom_string(LE,L),
         WOQL = '@'(V,LE)
+    ;   dict_pairs(JSON, _, ['@value'-V]),
+        (   string(V)
+        ;   atom(V)
+        ;   number(V))
+    ->  json_data_to_woql_ast(V,WOQL)
     ;   true = JSON
     ->  WOQL = true
     ;   % NOTE: @-prefixed keys in dictionaries destined for sys:JSON fields
@@ -265,6 +279,86 @@ json_type_to_woql_ast('TripleCount',JSON,WOQL,Path) :-
                            [count
                             |Path]),
     WOQL = triple_count(Resource_Atom,WOQL_Count).
+json_type_to_woql_ast('TripleCount',JSON,WOQL,Path) :-
+    _{subject : Subject,
+      predicate : Predicate,
+      object : Object,
+      count : Count,
+      graph : Graph
+     } :< JSON,
+    json_value_to_woql_ast(Subject,WQA,[subject
+                                        |Path]),
+    json_value_to_woql_ast(Predicate,WQB,[predicate
+                                          |Path]),
+    json_value_to_woql_ast(Object,WQC,[object
+                                       |Path]),
+    json_value_to_woql_ast(Count,WQN,[count
+                                      |Path]),
+    json_data_to_woql_ast(Graph,WG),
+    do_or_die(
+        (WG = Graph_String^^_),
+        error(woql_syntax_error(JSON,
+                                [graph|Path],
+                                Graph), _)),
+    WOQL = triple_count(WQA,WQB,WQC,WQN,Graph_String).
+json_type_to_woql_ast('TripleCount',JSON,WOQL,Path) :-
+    _{subject : Subject,
+      predicate : Predicate,
+      object : Object,
+      count : Count
+     } :< JSON,
+    json_value_to_woql_ast(Subject,WQA,[subject
+                                        |Path]),
+    json_value_to_woql_ast(Predicate,WQB,[predicate
+                                          |Path]),
+    json_value_to_woql_ast(Object,WQC,[object
+                                       |Path]),
+    json_value_to_woql_ast(Count,WQN,[count
+                                      |Path]),
+    WOQL = triple_count(WQA,WQB,WQC,WQN).
+json_type_to_woql_ast('TripleRangeCount',JSON,WOQL,Path) :-
+    _{subject : Subject,
+      predicate : Predicate,
+      low : Low,
+      high : High,
+      count : Count,
+      graph : Graph
+     } :< JSON,
+    json_value_to_woql_ast(Subject,WQA,[subject
+                                        |Path]),
+    json_value_to_woql_ast(Predicate,WQB,[predicate
+                                          |Path]),
+    json_value_to_woql_ast(Low,WQL,[low
+                                    |Path]),
+    json_value_to_woql_ast(High,WQH,[high
+                                     |Path]),
+    json_value_to_woql_ast(Count,WQN,[count
+                                      |Path]),
+    json_data_to_woql_ast(Graph,WG),
+    do_or_die(
+        (WG = Graph_String^^_),
+        error(woql_syntax_error(JSON,
+                                [graph|Path],
+                                Graph), _)),
+    WOQL = triple_range_count(WQA,WQB,WQL,WQH,WQN,Graph_String).
+json_type_to_woql_ast('TripleRangeCount',JSON,WOQL,Path) :-
+    _{subject : Subject,
+      predicate : Predicate,
+      low : Low,
+      high : High,
+      count : Count
+     } :< JSON,
+    json_value_to_woql_ast(Subject,WQA,[subject
+                                        |Path]),
+    json_value_to_woql_ast(Predicate,WQB,[predicate
+                                          |Path]),
+    json_value_to_woql_ast(Low,WQL,[low
+                                    |Path]),
+    json_value_to_woql_ast(High,WQH,[high
+                                     |Path]),
+    json_value_to_woql_ast(Count,WQN,[count
+                                      |Path]),
+    WOQL = triple_range_count(WQA,WQB,WQL,WQH,WQN).
 json_type_to_woql_ast('Size',JSON,WOQL,Path) :-
     _{  resource : Resource,
         size : Size
@@ -998,6 +1092,19 @@ json_type_to_woql_ast('IntervalRelationTyped',JSON,WOQL,Path) :-
     json_value_to_woql_ast(X,WX,[x|Path]),
     json_value_to_woql_ast(Y,WY,[y|Path]),
     WOQL = interval_relation_typed(WR,WX,WY).
+json_type_to_woql_ast('TripleRelation',JSON,WOQL,Path) :-
+    _{subject : Subject,
+      predicate : Predicate,
+      object : Object,
+      relation : Relation,
+      value : Value
+     } :< JSON,
+    json_value_to_woql_ast(Subject,WS,[subject|Path]),
+    json_value_to_woql_ast(Predicate,WP,[predicate|Path]),
+    json_value_to_woql_ast(Object,WO,[object|Path]),
+    json_value_to_woql_ast(Relation,WR,[relation|Path]),
+    json_value_to_woql_ast(Value,WV,[value|Path]),
+    WOQL = triple_relation(WS,WP,WO,WR,WV).
 json_type_to_woql_ast('Weekday',JSON,WOQL,Path) :-
     _{date : D,
       weekday : W
@@ -1116,6 +1223,15 @@ json_type_to_woql_ast('RandomKey',JSON,WOQL,Path) :-
     json_value_to_woql_ast(URI,WURI,[uri
                                      |Path]),
     WOQL = idgen_random(WBase,[],WURI).
+json_type_to_woql_ast('UuidV7',JSON,WOQL,Path) :-
+    _{base : Base,
+      uri : URI
+     } :< JSON,
+    json_value_to_woql_ast(Base,WBase,[base
+                                       |Path]),
+    json_value_to_woql_ast(URI,WURI,[uri
+                                     |Path]),
+    WOQL = idgen_uuid_v7(WBase,[],WURI).
 json_type_to_woql_ast('Upper',JSON,WOQL,Path) :-
     _{mixed :  S,
       upper : V
@@ -1385,7 +1501,13 @@ json_type_to_woql_ast('Typecast',JSON,WOQL,Path) :-
                                        |Path]),
     json_value_to_woql_ast(Var,WVar,[result
                                      |Path]),
-    WOQL = typecast(WVal,WType,WVar).
+    (   get_dict(prefixes, JSON, Prefixes)
+    ->  % Optional prefix map for expanded-name casts: literal dictionary or
+        % a variable bound elsewhere (e.g. via dot to a stored namespaces map).
+        json_value_to_woql_ast(Prefixes,WPrefixes,[prefixes
+                                                 |Path]),
+        WOQL = typecast(WVal,WType,WVar,WPrefixes)
+    ;   WOQL = typecast(WVal,WType,WVar)).
 json_type_to_woql_ast('Not',JSON,WOQL,Path) :-
     _{query : Q
      } :< JSON,
@@ -1636,10 +1758,7 @@ dictionary_template_to_woql_ast(Template, WOQL, Path) :-
                 get_dict(field, Pair, Key_String),
                 get_dict(value, Pair, V),
                 atom_string(Key,Key_String),
-                json_value_to_woql_ast(V, WOQL_Value, [value,I|Path]),
-                (   WOQL_Value = Value^^_ % unnecessary specificity
-                ->  true
-                ;   WOQL_Value = Value)
+                json_value_to_woql_ast(V, Value, [value,I|Path])
             ), Pairs, Indexes, NewPairs),
    !,
    dict_create(WOQL, json, NewPairs).
@@ -2222,6 +2341,9 @@ test(dictionary_template_to_woql_ast, []) :-
                                               "variable" : "Father"}}]}}',
     atom_json_dict(JSON_Atom, JSON, []),
     json_value_to_woql_ast(JSON,WOQL,[]),
-    WOQL = json{'@type':"User",employed:true,father:v('Father'),name:"Jim"}.
+    WOQL = json{'@type':"User"^^xsd:string,
+                employed:true^^xsd:boolean,
+                father:v('Father'),
+                name:"Jim"^^xsd:string}.
 
 :- end_tests(jsonld_ast).

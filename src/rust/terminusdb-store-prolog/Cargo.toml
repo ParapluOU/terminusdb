@@ -16,8 +16,12 @@ blitzar-gpu = ["query-proof", "terminus-store/blitzar-gpu", "terminusdb-query-pr
 [dependencies]
 swipl = {version="0.3.16", features=["serde"]}
 #terminus-store = {version="0.21.5", features=[]}
-#terminus-store = {path="../../../../terminusdb-store"}
-terminus-store = {version="0.21.8", features=[]}
+# A crates.io-shaped dependency ON PURPOSE, at the version the fork now tracks
+# (upstream 0.23.1): the workspace root patches crates-io terminus-store to the
+# ParapluOU proof fork, and a direct git dependency on terminusdb-org — as
+# 12.1.0-rc3 declares — would bypass that patch and build this server on the
+# unforked store, which writes no proof state.
+terminus-store = {version="0.23.1", features=[]}
 sha-1 = "0.9.1"
 hex = "0.4.2"
 encoding_rs = "0.8.24"
@@ -27,11 +31,12 @@ chrono = "0.4"
 rug = {version="1.16", default-features=false, features=["integer","rational"]}
 base64 = "0.13"
 
-terminusdb-grpc-labelstore-client = { git="https://github.com/terminusdb-labs/terminusdb-grpc-labelstore", rev="cb8cf29" }
+terminusdb-grpc-labelstore-client = { git="https://github.com/terminusdb-labs/terminusdb-grpc-labelstore", rev="4714750" }
 tdb-succinct = "0.2"
 # Explicit compile/prove/verify boundary; contains no scheduling policy.
 terminusdb-query-proof = { path = "../terminusdb-query-proof", optional = true }
 
 [dev-dependencies]
-# Use the same fork instance as Terminus Store so ArkFr/ArkGT are one type graph.
-dory-pcs = { path = "../../../../dory", default-features = false, features = ["arkworks"] }
+# The same git spec Terminus Store itself declares, so ArkFr/ArkGT are one type
+# graph (a sibling path would be a second copy, and unbuildable from a clone).
+dory-pcs = { git = "https://github.com/ParapluOU/dory", branch = "main", default-features = false, features = ["arkworks"] }

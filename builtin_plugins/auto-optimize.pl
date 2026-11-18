@@ -22,11 +22,28 @@
 gc_chance(0.005).          % 10% - GC runs on average every 100th commit
 optimize_chance(0.1).     % 10% - Optimization runs on average every 10th commit, for control and content graphs
 
-:- gc_chance(GC), optimize_chance(OPT),
-   GC_Pct is round(GC * 100),
-   OPT_Pct is round(OPT * 100),
-   format(atom(Msg), "auto-optimize plugin loaded: probabilistic GC (~w%) and optimization (~w%) enabled", [GC_Pct, OPT_Pct]),
-   json_log_info(Msg).
+%% optimizer_enabled is semidet.
+%
+%  As a built-in plugin this file is always loaded, and the probabilistic
+%  post-commit GC/optimize work is on by default — optimization should
+%  happen in production. Set TERMINUSDB_ENABLE_OPTIMIZER to a falsy value
+%  (0/false/no/off) to disable it — test harnesses do this because the
+%  random optimization timing breaks tests that rely on deterministic
+%  data versions.
+optimizer_enabled :-
+    (   getenv('TERMINUSDB_ENABLE_OPTIMIZER', Value)
+    ->  \+ memberchk(Value, ['0', 'false', 'no', 'off'])
+    ;   true
+    ).
+
+:- (   optimizer_enabled
+   ->  gc_chance(GC), optimize_chance(OPT),
+       GC_Pct is round(GC * 100),
+       OPT_Pct is round(OPT * 100),
+       format(atom(Msg), "auto-optimize plugin loaded: probabilistic GC (~w%) and optimization (~w%) enabled", [GC_Pct, OPT_Pct]),
+       json_log_info(Msg)
+   ;   json_log_info("auto-optimize plugin loaded (inactive; TERMINUSDB_ENABLE_OPTIMIZER disables optimization)")
+   ).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % Optimization predicates
@@ -136,13 +153,38 @@ print_stack_statistics_json(Label) :-
     },
     json_log_debug(Stats).
 
+% Probability of running abolish_all_tables during GC.
+% This is a rare global table cleanup — most GC cycles just collect
+% atoms and trim stacks. At 10%, this fires roughly once per 2000
+% commits (0.5% GC chance × 10% abolish chance), which is frequent
+% enough to reclaim stale tabled results without thrashing.
+abolish_tables_chance(0.10).
+
 % Actual GC work - runs in dedicated thread
 do_garbage_collect :-
     maybe_print_stats('PRE-GC'),
     garbage_collect,
     trim_stacks,
+    maybe_abolish_tables,
     maybe_print_stats('POST-GC'),
     json_log_debug("Ran garbage_collect").
+
+% Periodic deep cleanup: abolish all tabled results and reclaim atoms.
+% Fires at 10% of GC cycles (~0.05% of commits). Both operations are
+% global and can block other threads, so we run them together as a
+% rare periodic cleanup rather than independently.
+maybe_abolish_tables :-
+    abolish_tables_chance(Chance),
+    random(X),
+    (   X < Chance
+    ->  abolish_all_tables,
+        statistics(atoms, AtomsBefore),
+        garbage_collect_atoms,
+        statistics(atoms, AtomsAfter),
+        format(atom(Msg), "GC: periodic deep cleanup - abolished tables, reclaimed atoms (~w -> ~w)", [AtomsBefore, AtomsAfter]),
+        json_log_debug(Msg)
+    ;   true
+    ).
 
 maybe_print_stats(Label) :-
     log_level('DEBUG'),
@@ -243,6 +285,7 @@ commit_has_changes(Meta_Data) :-
     !.
 
 plugins:post_commit_hook(Validation_Objects, Meta_Data) :-
+    optimizer_enabled,
     % GC runs async in dedicated thread
     maybe_garbage_collect,
     % Only optimize if the commit actually changed triples

@@ -15,7 +15,8 @@
 :- use_module(core(transaction)).
 :- use_module(core(api/api_document), [
                   idlists_duplicates_toplevel/3,
-                  nonground_captures/2
+                  nonground_captures/2,
+                  compress_doc_ids/4
               ]).
 :- use_module(core(document/apply), [apply_diff_ids_captures/7]).
 :- use_module(core(document/history),
@@ -32,10 +33,34 @@
 :- use_module(library(apply_macros)).
 :- use_module(library(yall)).
 
-api_patch(_System_DB, _Auth, Patch, Before, After, Options) :-
-    % no auth yet.
-    simple_patch(Patch,Before,After,Options).
+api_patch(System_DB, Auth, Patch, Before, After, Options) :-
+    % No path to scope a descriptor check, so require the caller to
+    % hold instance_read_access somewhere; anonymous qualifies only on
+    % deployments with a public database.
+    assert_auth_action_scope(System_DB, Auth,
+                             '@schema':'Action/instance_read_access', _),
+    simple_patch(Patch,Before,Result0,Options),
+    % Wire ^^ tags are parse metadata for storage typing; the response is
+    % plain JSON, so strip them before rendering (storage paths keep them).
+    strip_wire_hints(Result0, After).
 
+patch_id(Patch, Id) :-
+    get_dict('@insert', Patch, Insert_Doc), !,
+    (   get_dict('@id', Insert_Doc, Id)
+    ->  true
+    ;   get_dict('@capture', Insert_Doc, Capture)
+    ->  atom_string(Id, Capture)
+    ;   throw(error(no_id_in_patch(Patch), _))
+    ).
+patch_id(Patch, Id) :-
+    get_dict('@delete', Patch, Delete_Candidate), !,
+    (   is_dict(Delete_Candidate)
+    ->  do_or_die(get_dict('@id', Delete_Candidate, Id),
+                  error(no_id_in_patch(Patch), _))
+    ;   (string(Delete_Candidate) ; atom(Delete_Candidate))
+    ->  Delete_Candidate = Id
+    ;   throw(error(no_id_in_patch(Patch), _))
+    ).
 patch_id(Patch, Id) :-
     do_or_die(
         get_dict('@id', Patch, Id),
@@ -66,7 +91,7 @@ map_apply_captures(Context,Options,Patch_And_Ids,Conflicts,Ids_List,Empty,Captur
         ).
 
 api_patch_resource(System_DB, Auth, Path, Patch, Commit_Info, Ids, Options) :-
-    resolve_descriptor_auth(read, System_DB, Auth, Path, instance, Branch_Descriptor),
+    resolve_descriptor_auth(write, System_DB, Auth, Path, instance, Branch_Descriptor),
     create_context(Branch_Descriptor, Commit_Info, Context),
     merge_options(Options, options{keep:json{'@id':true, '@type':true}}, Merged_Options),
     empty_assoc(Empty),
@@ -84,14 +109,18 @@ api_patch_resource(System_DB, Auth, Path, Patch, Commit_Info, Ids, Options) :-
             ->  true
             ;   throw(error(patch_conflicts(Witnesses)))
             ),
-            idlists_duplicates_toplevel(Ids_List, Duplicates, Ids),
-            die_if(Duplicates \= [], error(same_ids_in_one_transaction(Duplicates), _))
+            exclude(=([]), Ids_List, Non_Empty_Ids_List),
+            idlists_duplicates_toplevel(Non_Empty_Ids_List, Duplicates, Raw_Ids),
+            die_if(Duplicates \= [], error(same_ids_in_one_transaction(Duplicates), _)),
+            compress_doc_ids(true, Context, Raw_Ids, Ids)
         ),
         _
     ).
 
-api_diff(_System_DB, _Auth, Before, After, Diff, Options) :-
-    % no auth yet.
+api_diff(System_DB, Auth, Before, After, Diff, Options) :-
+    % Same existential read gate as api_patch/6.
+    assert_auth_action_scope(System_DB, Auth,
+                             '@schema':'Action/instance_read_access', _),
     do_or_die((ground(Before),
                ground(After)),
               error(unground_patch, _)),
@@ -214,7 +243,7 @@ api_diff_all_documents(System_DB, Auth, Path, Before_Version, After_Version, Dif
            ).
 
 api_apply_squash_commit(System_DB, Auth, Path, Commit_Info, Before_Version, After_Version, Options) :-
-    resolve_descriptor_auth(read, System_DB, Auth, Path, instance, Branch_Descriptor),
+    resolve_descriptor_auth(write, System_DB, Auth, Path, instance, Branch_Descriptor),
     coerce_to_commit(Branch_Descriptor, Before_Version, Before_Commit_Id),
     coerce_to_commit(Branch_Descriptor, After_Version, After_Commit_Id),
     create_context(Branch_Descriptor, Commit_Info, Context),
@@ -242,14 +271,14 @@ api_apply_squash_commit(System_DB, Auth, Path, Commit_Info, Before_Version, Afte
     ).
 
 
-
 :- begin_tests(apply).
 
 :- use_module(core(util/test_utils)).
 :- use_module(core(document)).
 :- use_module(core(triple)).
 :- use_module(core(api/api_document)).
-:- use_module(library(json)).
+:- use_module(core(api/db_branch)).
+:- use_module(library(http/json)).
 
 test(delete_missing,
      [setup((setup_temp_store(State),
@@ -334,4 +363,590 @@ test(insert_twice,
                             '@op':'InsertConflict'}]))
     ).
 
+test(schemaless_apply_insert_modify_delete,
+     [setup((setup_temp_store(State),
+             random_string(X),
+             string_concat("admin/",X, Path),
+             create_db_without_schema("admin", X)
+            )),
+      cleanup(teardown_temp_store(State))
+     ]) :-
+    open_descriptor(system_descriptor{}, SystemDB),
+    super_user_authority(Auth),
+    Options = [author("gavin"), message("test."), raw_json(true)],
+
+    open_string('[{"@id":"item/a","name":"alpha","n":1},{"@id":"item/c","name":"gamma","n":3}]', Stream1),
+    api_insert_documents(SystemDB, Auth, Path, Stream1, no_data_version,
+                         data_version(branch,Commit1), _, _Ids1, Options),
+
+    open_string('["item/c"]', Stream2),
+    api_delete_documents(SystemDB, Auth, Path, Stream2, no_data_version,
+                         _Data_Version2, _, _Ids2, Options),
+
+    open_string('{"@id":"item/a","name":"alpha","n":99}', Stream3),
+    api_replace_documents(SystemDB, Auth, Path, Stream3, no_data_version,
+                          _Data_Version3, _, _Ids3, [create(false)|Options]),
+
+    open_string('{"@id":"item/b","name":"beta","n":2}', Stream4),
+    api_insert_documents(SystemDB, Auth, Path, Stream4, no_data_version,
+                         data_version(branch,Commit4), _, _Ids4, Options),
+
+    atomic_list_concat([Path, '/local/branch/dev'], Dev_Path),
+    atomic_list_concat([Path, '/local/commit/', Commit1], Commit_Path),
+    branch_create(SystemDB, Auth, Dev_Path, branch(Commit_Path), _Branch_Uri),
+
+    Commit_Info = commit_info{ author : "gavin", message: "apply" },
+    api_apply_squash_commit(SystemDB, Auth, Dev_Path, Commit_Info,
+                            Commit1, Commit4, [match_final_state(false)]),
+
+    resolve_absolute_string_descriptor(Dev_Path, Dev_Descriptor),
+    open_descriptor(Dev_Descriptor, Dev_Transaction),
+    get_document(Dev_Transaction, 'item/a', Doc_A),
+    get_dict(n, Doc_A, 99),
+    get_document(Dev_Transaction, 'item/b', _Doc_B),
+    \+ get_document(Dev_Transaction, 'item/c', _Doc_C).
+
 :- end_tests(apply).
+
+:- begin_tests(patch_resource).
+
+:- use_module(core(util/test_utils)).
+:- use_module(core(document)).
+:- use_module(core(triple)).
+:- use_module(core(api/api_document)).
+:- use_module(library(json)).
+
+test(patch_resource_insert,
+     [setup((setup_temp_store(State),
+             random_string(X),
+             string_concat("admin/",X, Path),
+             create_db_with_test_schema("admin", X)
+            )),
+      cleanup(teardown_temp_store(State))
+     ]) :-
+    open_descriptor(system_descriptor{}, SystemDB),
+    super_user_authority(Auth),
+    Commit_Info = commit_info{ author : "test", message: "insert via patch" },
+    Patch = [json{ '@op':'Insert',
+                    '@insert':json{ '@id':"City/Leipzig",
+                                    '@type':"City",
+                                    name:"Leipzig" }}],
+    api_patch_resource(SystemDB, Auth, Path, Patch, Commit_Info, _Ids, []),
+    resolve_absolute_string_descriptor(Path, Desc),
+    open_descriptor(Desc, T),
+    get_document(T, 'City/Leipzig', Doc),
+    get_dict(name, Doc, "Leipzig").
+
+test(patch_resource_delete,
+     [setup((setup_temp_store(State),
+             random_string(X),
+             string_concat("admin/",X, Path),
+             create_db_with_test_schema("admin", X)
+            )),
+      cleanup(teardown_temp_store(State))
+     ]) :-
+    open_descriptor(system_descriptor{}, SystemDB),
+    super_user_authority(Auth),
+    Graph_Type = instance,
+    Options = [graph_type(Graph_Type),
+               author("test"),
+               message("setup")],
+    open_string('{"@type" : "City", "name" : "Warsaw"}', Stream),
+    api_insert_documents(SystemDB, Auth, Path, Stream, no_data_version, _DV1, _Transaction_Meta_Data, Inserted_Ids, Options),
+    Inserted_Ids = [City_Id],
+    Commit_Info = commit_info{ author : "test", message: "delete via patch" },
+    Patch = [json{ '@op':'Delete',
+                    '@delete':json{ '@id':City_Id }}],
+    api_patch_resource(SystemDB, Auth, Path, Patch, Commit_Info, _Ids, []),
+    resolve_absolute_string_descriptor(Path, Desc),
+    open_descriptor(Desc, T),
+    \+ get_document(T, City_Id, _).
+
+test(patch_resource_delete_string,
+     [setup((setup_temp_store(State),
+             random_string(X),
+             string_concat("admin/",X, Path),
+             create_db_with_test_schema("admin", X)
+            )),
+      cleanup(teardown_temp_store(State))
+     ]) :-
+    open_descriptor(system_descriptor{}, SystemDB),
+    super_user_authority(Auth),
+    Graph_Type = instance,
+    Options = [graph_type(Graph_Type),
+               author("test"),
+               message("setup")],
+    open_string('{"@type" : "City", "name" : "Warsaw"}', Stream),
+    api_insert_documents(SystemDB, Auth, Path, Stream, no_data_version, _DV1, _Transaction_Meta_Data, Inserted_Ids, Options),
+    Inserted_Ids = [City_Id],
+    Commit_Info = commit_info{ author : "test", message: "delete via patch string" },
+    Patch = [json{ '@op':'Delete',
+                    '@delete':City_Id }],
+    api_patch_resource(SystemDB, Auth, Path, Patch, Commit_Info, _Ids, []),
+    resolve_absolute_string_descriptor(Path, Desc),
+    open_descriptor(Desc, T),
+    \+ get_document(T, City_Id, _).
+
+test(patch_resource_mixed,
+     [setup((setup_temp_store(State),
+             random_string(X),
+             string_concat("admin/",X, Path),
+             create_db_with_test_schema("admin", X)
+            )),
+      cleanup(teardown_temp_store(State))
+     ]) :-
+    open_descriptor(system_descriptor{}, SystemDB),
+    super_user_authority(Auth),
+    Graph_Type = instance,
+    Options = [graph_type(Graph_Type),
+               author("test"),
+               message("setup")],
+    open_string('{"@type" : "City", "name" : "Warsaw"}', Stream),
+    api_insert_documents(SystemDB, Auth, Path, Stream, no_data_version, _DV1, _Transaction_Meta_Data, [City_Id], Options),
+    Commit_Info = commit_info{ author : "test", message: "mixed patch" },
+    Patch = [json{ '@op':'Delete',
+                    '@delete':json{ '@id':City_Id }},
+             json{ '@op':'Insert',
+                    '@insert':json{ '@id':"City/Berlin",
+                                    '@type':"City",
+                                    name:"Berlin" }}],
+    api_patch_resource(SystemDB, Auth, Path, Patch, Commit_Info, _Ids, []),
+    resolve_absolute_string_descriptor(Path, Desc),
+    open_descriptor(Desc, T),
+    get_document(T, 'City/Berlin', Berlin),
+    get_dict(name, Berlin, "Berlin"),
+    \+ get_document(T, City_Id, _).
+
+test(patch_resource_insert_conflict,
+     [setup((setup_temp_store(State),
+             random_string(X),
+             string_concat("admin/",X, Path),
+             create_db_with_test_schema("admin", X)
+            )),
+      cleanup(teardown_temp_store(State)),
+      throws(error(patch_conflicts([json{'@id_already_exists':_,
+                                          '@op':'InsertConflict'}])))
+     ]) :-
+    open_descriptor(system_descriptor{}, SystemDB),
+    super_user_authority(Auth),
+    Graph_Type = instance,
+    Options = [graph_type(Graph_Type),
+               author("test"),
+               message("setup")],
+    open_string('{"@type" : "City", "name" : "Warsaw"}', Stream),
+    api_insert_documents(SystemDB, Auth, Path, Stream, no_data_version, _DV1, _Transaction_Meta_Data, [City_Id], Options),
+    Commit_Info = commit_info{ author : "test", message: "insert conflict" },
+    Patch = [json{ '@op':'Insert',
+                    '@insert':json{ '@id':City_Id,
+                                    '@type':"City",
+                                    name:"Warsaw" }}],
+    api_patch_resource(SystemDB, Auth, Path, Patch, Commit_Info, _Ids, []).
+
+test(patch_resource_delete_conflict,
+     [setup((setup_temp_store(State),
+             random_string(X),
+             string_concat("admin/",X, Path),
+             create_db_with_test_schema("admin", X)
+            )),
+      cleanup(teardown_temp_store(State)),
+      throws(error(patch_conflicts([json{'@id_does_not_exists':_,
+                                         '@op':'DeleteConflict'}])))
+     ]) :-
+    open_descriptor(system_descriptor{}, SystemDB),
+    super_user_authority(Auth),
+    Commit_Info = commit_info{ author : "test", message: "delete conflict" },
+    Patch = [json{ '@op':'Delete',
+                    '@delete':json{ '@id':"City/Nonexistent" }}],
+    api_patch_resource(SystemDB, Auth, Path, Patch, Commit_Info, _Ids, []).
+
+test(patch_resource_insert_match_final_state,
+     [setup((setup_temp_store(State),
+             random_string(X),
+             string_concat("admin/",X, Path),
+             create_db_with_test_schema("admin", X)
+            )),
+      cleanup(teardown_temp_store(State))
+     ]) :-
+    open_descriptor(system_descriptor{}, SystemDB),
+    super_user_authority(Auth),
+    Graph_Type = instance,
+    Options = [graph_type(Graph_Type),
+               author("test"),
+               message("setup")],
+    open_string('{"@type" : "City", "name" : "Warsaw"}', Stream),
+    api_insert_documents(SystemDB, Auth, Path, Stream, no_data_version, _DV1, _Transaction_Meta_Data, [City_Id], Options),
+    Commit_Info = commit_info{ author : "test", message: "insert match final state" },
+    Patch = [json{ '@op':'Insert',
+                    '@insert':json{ '@id':City_Id,
+                                    '@type':"City",
+                                    name:"Warsaw" }}],
+    api_patch_resource(SystemDB, Auth, Path, Patch, Commit_Info, _Ids,
+                       [match_final_state(true)]).
+
+test(patch_resource_delete_match_final_state,
+     [setup((setup_temp_store(State),
+             random_string(X),
+             string_concat("admin/",X, Path),
+             create_db_with_test_schema("admin", X)
+            )),
+      cleanup(teardown_temp_store(State))
+     ]) :-
+    open_descriptor(system_descriptor{}, SystemDB),
+    super_user_authority(Auth),
+    Commit_Info = commit_info{ author : "test", message: "delete match final state" },
+    Patch = [json{ '@op':'Delete',
+                    '@delete':json{ '@id':'City/Nonexistent' }}],
+    api_patch_resource(SystemDB, Auth, Path, Patch, Commit_Info, _Ids,
+                       [match_final_state(true)]).
+
+test(patch_resource_mixed_conflict,
+     [setup((setup_temp_store(State),
+             random_string(X),
+             string_concat("admin/",X, Path),
+             create_db_with_test_schema("admin", X)
+            )),
+      cleanup(teardown_temp_store(State)),
+      throws(error(patch_conflicts(_)))
+     ]) :-
+    open_descriptor(system_descriptor{}, SystemDB),
+    super_user_authority(Auth),
+    Commit_Info = commit_info{ author : "test", message: "mixed conflict" },
+    Patch = [json{ '@op':'Insert',
+                    '@insert':json{ '@id':"City/Berlin",
+                                    '@type':"City",
+                                    name:"Berlin" }},
+             json{ '@op':'Delete',
+                    '@delete':json{ '@id':"City/Nonexistent" }}],
+    api_patch_resource(SystemDB, Auth, Path, Patch, Commit_Info, _Ids, []).
+
+test(patch_resource_match_final_state_empty_ids,
+     [setup((setup_temp_store(State),
+             random_string(X),
+             string_concat("admin/",X, Path),
+             create_db_with_test_schema("admin", X)
+            )),
+      cleanup(teardown_temp_store(State))
+     ]) :-
+    open_descriptor(system_descriptor{}, SystemDB),
+    super_user_authority(Auth),
+    Commit_Info = commit_info{ author : "test", message: "match final state empty ids" },
+    Patch = [json{ '@op':'Delete',
+                    '@delete':json{ '@id':"City/Nonexistent" }}],
+    api_patch_resource(SystemDB, Auth, Path, Patch, Commit_Info, _Ids,
+                       [match_final_state(true)]).
+
+test(patch_resource_insert_no_id_error,
+     [setup((setup_temp_store(State),
+             random_string(X),
+             string_concat("admin/",X, Path),
+             create_db_with_test_schema("admin", X)
+            )),
+      cleanup(teardown_temp_store(State)),
+      throws(error(no_id_in_patch(_), _))
+     ]) :-
+    open_descriptor(system_descriptor{}, SystemDB),
+    super_user_authority(Auth),
+    Commit_Info = commit_info{ author : "test", message: "no id" },
+    Patch = [json{ '@op':'Insert',
+                    '@insert':json{ '@type':"City",
+                                    name:"NoID" }}],
+    api_patch_resource(SystemDB, Auth, Path, Patch, Commit_Info, _Ids, []).
+
+test(patch_resource_insert_with_captures,
+     [setup((setup_temp_store(State),
+             random_string(X),
+             string_concat("admin/",X, Path),
+             create_db_with_empty_schema("admin", X)
+            )),
+      cleanup(teardown_temp_store(State))
+     ]) :-
+    open_descriptor(system_descriptor{}, SystemDB),
+    super_user_authority(Auth),
+    Schema = json{ '@type':"Class", '@id':"Person", name:"xsd:string", friend:"Person" },
+    Commit_Info_Schema = commit_info{ author : "test", message: "add schema" },
+    resolve_absolute_string_descriptor(Path, Schema_Desc),
+    create_context(Schema_Desc, Commit_Info_Schema, Schema_Context),
+    with_transaction(Schema_Context, insert_schema_document(Schema_Context, Schema), _),
+    Commit_Info = commit_info{ author : "test", message: "captures insert" },
+    Patch = [json{ '@op':'Insert',
+                    '@insert':json{ '@type':"Person",
+                                    '@capture':"PersonA",
+                                    name:"Alice",
+                                    friend:json{'@ref':"PersonB"}}},
+             json{ '@op':'Insert',
+                    '@insert':json{ '@type':"Person",
+                                    '@capture':"PersonB",
+                                    name:"Bob",
+                                    friend:json{'@ref':"PersonA"}}}],
+    api_patch_resource(SystemDB, Auth, Path, Patch, Commit_Info, Ids, []),
+    length(Ids, 2),
+    resolve_absolute_string_descriptor(Path, Desc),
+    open_descriptor(Desc, T),
+    findall(Name,
+            (   member(Id, Ids),
+                get_document(T, Id, Doc),
+                get_dict(name, Doc, Name)
+            ),
+            Names),
+    memberchk("Alice", Names),
+    memberchk("Bob", Names).
+
+test(patch_resource_unmatched_capture_fails,
+     [setup((setup_temp_store(State),
+             random_string(X),
+             string_concat("admin/",X, Path),
+             create_db_with_empty_schema("admin", X)
+            )),
+      cleanup(teardown_temp_store(State)),
+      throws(error(not_all_captures_found(_), _))
+     ]) :-
+    open_descriptor(system_descriptor{}, SystemDB),
+    super_user_authority(Auth),
+    Schema = json{ '@type':"Class", '@id':"Person", name:"xsd:string", friend:"Person" },
+    Commit_Info_Schema = commit_info{ author : "test", message: "add schema" },
+    resolve_absolute_string_descriptor(Path, Schema_Desc),
+    create_context(Schema_Desc, Commit_Info_Schema, Schema_Context),
+    with_transaction(Schema_Context, insert_schema_document(Schema_Context, Schema), _),
+    Commit_Info = commit_info{ author : "test", message: "unmatched capture" },
+    Patch = [json{ '@op':'Insert',
+                    '@insert':json{ '@type':"Person",
+                                    '@capture':"PersonA",
+                                    name:"Alice",
+                                    friend:json{'@ref':"Nonexistent"}}}],
+    api_patch_resource(SystemDB, Auth, Path, Patch, Commit_Info, _Ids, []).
+
+test(patch_resource_insert_with_id_and_capture,
+     [setup((setup_temp_store(State),
+             random_string(X),
+             string_concat("admin/",X, Path),
+             create_db_with_empty_schema("admin", X)
+            )),
+      cleanup(teardown_temp_store(State))
+     ]) :-
+    open_descriptor(system_descriptor{}, SystemDB),
+    super_user_authority(Auth),
+    Schema = json{ '@type':"Class", '@id':"Person", name:"xsd:string", friend:"Person" },
+    Commit_Info_Schema = commit_info{ author : "test", message: "add schema" },
+    resolve_absolute_string_descriptor(Path, Schema_Desc),
+    create_context(Schema_Desc, Commit_Info_Schema, Schema_Context),
+    with_transaction(Schema_Context, insert_schema_document(Schema_Context, Schema), _),
+    Commit_Info = commit_info{ author : "test", message: "id and capture" },
+    Patch = [json{ '@op':'Insert',
+                    '@insert':json{ '@id':"Person/Alice",
+                                    '@type':"Person",
+                                    '@capture':"PersonA",
+                                    name:"Alice",
+                                    friend:json{'@ref':"PersonB"}}},
+             json{ '@op':'Insert',
+                    '@insert':json{ '@id':"Person/Bob",
+                                    '@type':"Person",
+                                    '@capture':"PersonB",
+                                    name:"Bob",
+                                    friend:json{'@ref':"PersonA"}}}],
+    api_patch_resource(SystemDB, Auth, Path, Patch, Commit_Info, Ids, []),
+    length(Ids, 2),
+    resolve_absolute_string_descriptor(Path, Desc),
+    open_descriptor(Desc, T),
+    findall(Name,
+            (   member(Id, Ids),
+                get_document(T, Id, Doc),
+                get_dict(name, Doc, Name)
+            ),
+            Names),
+    length(Names, 2),
+    memberchk(Name_A, Names),
+    (   atom_string(Name_A, "Alice")
+    ->  true
+    ;   atom_string(Name_A, "Bob")
+    ->  true
+    ;   fail
+    ).
+
+test(patch_resource_field_patch_with_captures,
+     [setup((setup_temp_store(State),
+             random_string(X),
+             string_concat("admin/",X, Path),
+             create_db_with_empty_schema("admin", X)
+            )),
+      cleanup(teardown_temp_store(State))
+     ]) :-
+    open_descriptor(system_descriptor{}, SystemDB),
+    super_user_authority(Auth),
+    Schema = json{ '@type':"Class", '@id':"Person", name:"xsd:string", friend:"Person" },
+    Commit_Info_Schema = commit_info{ author : "test", message: "add schema" },
+    resolve_absolute_string_descriptor(Path, Schema_Desc),
+    create_context(Schema_Desc, Commit_Info_Schema, Schema_Context),
+    with_transaction(Schema_Context, insert_schema_document(Schema_Context, Schema), _),
+    Commit_Info = commit_info{ author : "test", message: "field patch with captures" },
+    Patch = [json{ '@op':'Insert',
+                    '@insert':json{ '@id':"Person/Alice",
+                                    '@type':"Person",
+                                    '@capture':"PersonA",
+                                    name:"Alice",
+                                    friend:json{'@ref':"PersonB"}}},
+             json{ '@op':'Insert',
+                    '@insert':json{ '@id':"Person/Bob",
+                                    '@type':"Person",
+                                    '@capture':"PersonB",
+                                    name:"Bob",
+                                    friend:json{'@ref':"PersonA"}}},
+             json{ '@op':'Insert',
+                    '@insert':json{ '@id':"Person/Charlie",
+                                    '@type':"Person",
+                                    name:"Charlie",
+                                    friend:json{'@ref':"PersonA"}}}],
+    api_patch_resource(SystemDB, Auth, Path, Patch, Commit_Info, Ids, []),
+    Field_Commit = commit_info{ author : "test", message: "field patch" },
+    Field_Patch = [json{ '@id':"Person/Charlie",
+                         name:json{'@op':'SwapValue',
+                                   '@before':"Charlie",
+                                   '@after':"Charles"}}],
+    api_patch_resource(SystemDB, Auth, Path, Field_Patch, Field_Commit, _, []),
+    resolve_absolute_string_descriptor(Path, Desc),
+    open_descriptor(Desc, T),
+    findall(Name,
+            (   member(Id, Ids),
+                get_document(T, Id, Doc),
+                get_dict(name, Doc, Name)
+            ),
+            Names),
+    length(Names, 3),
+    get_document(T, 'Person/Charlie', Doc_C),
+    get_dict(name, Doc_C, Name_C),
+    atom_string(Name_C, "Charles").
+
+test(patch_resource_field_patch_swapvalue_with_ref,
+     [setup((setup_temp_store(State),
+             random_string(X),
+             string_concat("admin/",X, Path),
+             create_db_with_empty_schema("admin", X)
+            )),
+      cleanup(teardown_temp_store(State))
+     ]) :-
+    open_descriptor(system_descriptor{}, SystemDB),
+    super_user_authority(Auth),
+    Schema = json{ '@type':"Class", '@id':"Person", name:"xsd:string", friend:json{'@type':"Optional", '@class':"Person"} },
+    Commit_Info_Schema = commit_info{ author : "test", message: "add schema" },
+    resolve_absolute_string_descriptor(Path, Schema_Desc),
+    create_context(Schema_Desc, Commit_Info_Schema, Schema_Context),
+    with_transaction(Schema_Context, insert_schema_document(Schema_Context, Schema), _),
+    Setup_Commit = commit_info{ author : "test", message: "insert Charlie" },
+    Setup_Patch = [json{ '@op':'Insert',
+                         '@insert':json{ '@id':"Person/Charlie",
+                                         '@type':"Person",
+                                         name:"Charlie"}}],
+    api_patch_resource(SystemDB, Auth, Path, Setup_Patch, Setup_Commit, _, []),
+    Patch = [json{ '@op':'Insert',
+                   '@insert':json{ '@id':"Person/Alice",
+                                   '@type':"Person",
+                                   '@capture':"PersonA",
+                                   name:"Alice",
+                                   friend:json{'@ref':"PersonB"}}},
+             json{ '@op':'Insert',
+                   '@insert':json{ '@id':"Person/Bob",
+                                   '@type':"Person",
+                                   '@capture':"PersonB",
+                                   name:"Bob",
+                                   friend:json{'@ref':"PersonA"}}},
+             json{ '@id':"Person/Charlie",
+                   friend:json{'@op':'SwapValue',
+                               '@before':null,
+                               '@after':json{'@ref':"PersonA"}}}],
+    Commit_Info = commit_info{ author : "test", message: "insert and swap Charlie friend with ref" },
+    api_patch_resource(SystemDB, Auth, Path, Patch, Commit_Info, _, []),
+    resolve_absolute_string_descriptor(Path, Desc),
+    open_descriptor(Desc, T),
+    get_document(T, 'Person/Charlie', Doc_C),
+    get_dict(friend, Doc_C, Friend_C),
+    atom_string(Friend_C, "Person/Alice").
+
+test(patch_resource_schemaless_field_patch,
+     [setup((setup_temp_store(State),
+             random_string(X),
+             string_concat("admin/",X, Path),
+             create_db_without_schema("admin", X)
+            )),
+      cleanup(teardown_temp_store(State))
+     ]) :-
+    open_descriptor(system_descriptor{}, SystemDB),
+    super_user_authority(Auth),
+    open_string('{"@id":"item/a","name":"alpha","n":1}', Stream),
+    api_insert_documents(SystemDB, Auth, Path, Stream, no_data_version, _DV, _, _Ids,
+                         [author("test"), message("setup"), raw_json(true)]),
+    Commit_Info = commit_info{ author : "test", message: "field patch" },
+    Patch = [json{ '@id':"item/a",
+                   n:json{ '@op':'SwapValue',
+                           '@before':1,
+                           '@after':42}}],
+    api_patch_resource(SystemDB, Auth, Path, Patch, Commit_Info, _Patch_Ids, []),
+    resolve_absolute_string_descriptor(Path, Desc),
+    open_descriptor(Desc, T),
+    get_document(T, 'item/a', Doc),
+    get_dict(n, Doc, 42).
+
+test(patch_resource_returns_compressed_ids,
+     [setup((setup_temp_store(State),
+             random_string(X),
+             string_concat("admin/",X, Path),
+             create_db_with_test_schema("admin", X)
+            )),
+      cleanup(teardown_temp_store(State))
+     ]) :-
+    open_descriptor(system_descriptor{}, SystemDB),
+    super_user_authority(Auth),
+    Commit_Info = commit_info{ author : "test", message: "compressed ids" },
+    Patch = [json{ '@op':'Insert',
+                   '@insert':json{ '@id':"City/Berlin",
+                                   '@type':"City",
+                                   name:"Berlin" }}],
+    api_patch_resource(SystemDB, Auth, Path, Patch, Commit_Info, Ids, []),
+    Ids = [Id],
+    atom_string(Id_Atom, Id),
+    atom_concat('City/', Local, Id_Atom),
+    atom_concat('Berlin', '', Local).
+
+:- end_tests(patch_resource).
+
+:- begin_tests(patch_diff_auth).
+
+:- use_module(core(util/test_utils)).
+
+% The pure patch/diff helpers take no path, so they cannot scope a
+% descriptor check. They still burn CPU on request, so require the
+% caller to hold instance_read_access on some resource — the same
+% action class their descriptor-scoped siblings require — which public
+% databases grant to anonymous.
+expect_read_denied(Goal) :-
+    (   catch(Goal, Ball, true)
+    ->  (   Ball = error(access_not_authorised(_,_,_),_)
+        ->  true
+        ;   format(user_error, '~nexpected access_not_authorised, got ~p~n', [Ball]),
+            fail)
+    ;   format(user_error, '~nexpected access_not_authorised, but call succeeded~n', []),
+        fail).
+
+test(deny_caller_without_any_read_access,
+     [setup((setup_temp_store(State),
+             create_db_without_schema("admin","priv"))),
+      cleanup(teardown_temp_store(State))
+     ]) :-
+    open_descriptor(system_descriptor{}, SystemDB),
+    forall(member(Goal,
+                  [ api_patch(SystemDB, 'User/unprivileged', json{n:1}, json{n:2}, _After, []),
+                    api_diff(SystemDB, 'User/unprivileged', json{n:1}, json{n:2}, _Diff, [])
+                  ]),
+           expect_read_denied(Goal)).
+
+test(allow_anonymous_on_public_database,
+     [setup((setup_temp_store(State),
+             create_public_db_without_schema("admin","pub"))),
+      cleanup(teardown_temp_store(State))
+     ]) :-
+    open_descriptor(system_descriptor{}, SystemDB),
+    api_patch(SystemDB, 'User/anonymous',
+              json{n:json{'@op':'SwapValue','@before':1,'@after':2}},
+              json{n:1}, _After, []),
+    api_diff(SystemDB, 'User/anonymous', json{n:1}, json{n:2}, _Diff,
+             [keep(json{}),unfold(true)]).
+
+:- end_tests(patch_diff_auth).

@@ -1,7 +1,13 @@
 :- module(request_worker_pool, [
                   init_request_worker_pool/1,
                   dispatch_request/5,
-                  dispatch_request/6
+                  dispatch_request/6,
+                  dispatch_request/7,
+                  dispatch_indexer_request/7,
+                  worker_pool_stats/1,
+                  worker_busy_stats/1,
+                  cancel_pipe_request/1,
+                  cancel_pipe_request/2
               ]).
 
 :- use_module(library(http/http_dispatch)).
@@ -18,7 +24,10 @@
 :- use_module(library(unix)).
 :- use_module(library(uri)).
 :- use_module(core(appserver_hooks)).
-:- use_module(core(util)).
+:- use_module(core(plugin_api), [plugin_error_response/2]).
+:- use_module(core(util), [saved_request/5]).
+:- use_module(core(util/json_log)).
+:- use_module(core(util/test_utils), [with_quiet_user_error/1]).
 :- use_module(server(routes/srv_http)).
 :- use_module(server(routes/tdb_http_handler)).
 
@@ -33,8 +42,10 @@
 %% observable via thread_property/2. A dead worker is a fatal condition
 %% that must crash the server, not silently degrade.
 
-:- dynamic worker_queue/1.
+:- dynamic round_robin_queue/1.
 :- dynamic worker/3.  % worker(Queue, ThreadId, Alias)
+
+:- dynamic indexer_queue/1.
 
 %% Watchdog state
 %%
@@ -52,6 +63,42 @@
 :- dynamic worker_busy/2.
 :- dynamic watchdog_running/0.
 :- dynamic watchdog_queue/1.
+
+%% Pipe cancellation state
+%%
+%% active_pipe/3 links an output pipe FD to the worker thread handling it:
+%%   active_pipe(OutputWriteFd, ThreadId, Alias)
+%% When a client disconnects, Rust calls cancel_pipe_request/1 with the
+%% output write FD. The predicate looks up the thread and signals it with
+%% error(client_disconnected, _) so the worker aborts its current work
+%% at the next goal boundary (e.g. between id_triple calls in WOQL).
+:- dynamic active_pipe/3.
+
+:- dynamic active_pipe_request/2.  % active_pipe_request(Fd, RequestId)
+
+%% worker_pool_stats(-Stats) is det.
+%%
+%%  Returns a dict with pool size, idle count, and busy count.
+%%  Intended for Prometheus metrics collection.
+worker_pool_stats(Stats) :-
+    findall(Alias, (round_robin_queue(Q), worker(Q, _, Alias)), AllAliases),
+    length(AllAliases, Total),
+    findall(Alias, worker_busy(Alias, _), BusyAliases),
+    length(BusyAliases, Busy),
+    Idle is Total - Busy,
+    Stats = _{total: Total, idle: Idle, busy: Busy}.
+
+%% worker_busy_stats(-BusyList) is det.
+%%
+%%  Returns a list of dicts with alias and dispatch_time_seconds
+%%  for each currently busy worker.
+worker_busy_stats(BusyList) :-
+    findall(_{alias: Alias, dispatch_time_seconds: Seconds},
+            (   worker_busy(Alias, DispatchTime),
+                get_time(Now),
+                Seconds is Now - DispatchTime
+            ),
+            BusyList).
 
 %% watchdog_grace_period(-Grace) is det.
 %%
@@ -101,14 +148,47 @@ init_request_worker_pool(Workers) :-
         message_queue_create(Queue),
         atom_concat(worker_, I, Alias),
         thread_create(worker_loop(Queue), ThreadId,
-                      [detached(false), alias(Alias),
-                       stack_limit(8_589_934_592)]),
-        assertz(worker_queue(Queue)),
+                      [detached(false), alias(Alias)]),
+        assertz(round_robin_queue(Queue)),
         assertz(worker(Queue, ThreadId, Alias)),
         fail
     ;   true
     ),
+    %% A large index can occupy a worker for minutes.
+    (   indexer_queue(_)
+    ->  true
+    ;   message_queue_create(IndexerQueue),
+        thread_create(worker_loop(IndexerQueue), IndexerThreadId,
+                      [detached(false), alias(indexer_worker_1)]),
+        assertz(indexer_queue(IndexerQueue)),
+        assertz(worker(IndexerQueue, IndexerThreadId, indexer_worker_1))
+    ),
     start_watchdog.
+
+%% stop_request_worker_pool is det.
+%%
+%%  Every step tolerates absence, so a partially started pool stops too.
+stop_request_worker_pool :-
+    forall(worker(Queue, _T1, _A1),
+           catch(thread_send_message(Queue, shutdown), _, true)),
+    forall(worker(Queue, ThreadId, _A2),
+           (   catch(thread_join(ThreadId, _), _, true),
+               catch(message_queue_destroy(Queue), _, true)
+           )),
+    (   watchdog_queue(WQ)
+    ->  catch(thread_send_message(WQ, stop), _, true),
+        catch(thread_join(worker_watchdog, _), _, true),
+        catch(message_queue_destroy(WQ), _, true)
+    ;   true
+    ),
+    retractall(worker(_, _, _)),
+    retractall(round_robin_queue(_)),
+    retractall(indexer_queue(_)),
+    retractall(worker_busy(_, _)),
+    retractall(watchdog_queue(_)),
+    retractall(watchdog_running),
+    retractall(active_pipe(_, _, _)),
+    retractall(active_pipe_request(_, _)).
 
 %% check_worker_alive(+Queue) is det.
 %%
@@ -143,8 +223,8 @@ check_worker_alive(Queue) :-
 %%    3. Capture the handler output, parse it into a response dict
 %%    4. Send the response to the Rust response stream and close it
 dispatch_request(Request, HandlerModule, HandlerName, InputStreamId, ResponseStreamId) :-
-    (   retract(worker_queue(Q))
-    ->  assertz(worker_queue(Q)),
+    (   retract(round_robin_queue(Q))
+    ->  assertz(round_robin_queue(Q)),
         check_worker_alive(Q),
         mark_worker_busy(Q),
         thread_send_message(Q, work(stream(Request, HandlerModule, HandlerName, InputStreamId, ResponseStreamId)))
@@ -159,14 +239,38 @@ dispatch_request(Request, HandlerModule, HandlerName, InputStreamId, ResponseStr
 %%  input/output file descriptors as Prolog streams and run the CGI handler
 %%  directly on the output pipe.
 dispatch_request(Request, HandlerModule, HandlerName, InputReadFd, OutputWriteFd, Binary) :-
-    (   retract(worker_queue(Q))
-    ->  assertz(worker_queue(Q)),
+    dispatch_request(Request, HandlerModule, HandlerName, InputReadFd, OutputWriteFd, Binary, unknown).
+
+%% dispatch_request(+RequestDict, +HandlerModule, +HandlerName,
+%%                  +InputReadFd, +OutputWriteFd, +Binary, +RequestId) is det.
+dispatch_request(Request, HandlerModule, HandlerName, InputReadFd, OutputWriteFd, Binary, RequestId) :-
+    (   retract(round_robin_queue(Q))
+    ->  assertz(round_robin_queue(Q)),
         check_worker_alive(Q),
         mark_worker_busy(Q),
-        thread_send_message(Q, work(pipe(Request, HandlerModule, HandlerName, InputReadFd, OutputWriteFd, Binary)))
+        enqueue_pipe_work(Q, Request, HandlerModule, HandlerName, InputReadFd, OutputWriteFd, Binary, RequestId)
     ;   json_log_error_formatted("dispatch_request: no worker queue available", []),
         throw(error(no_worker_available, _))
     ).
+
+%% dispatch_indexer_request(+RequestDict, +HandlerModule, +HandlerName,
+%%                          +InputReadFd, +OutputWriteFd, +Binary,
+%%                          +RequestId) is det.
+%%
+%%  The worker is not marked busy — an index run legitimately holds it
+%%  for minutes, so the busy-warning does not apply.
+dispatch_indexer_request(Request, HandlerModule, HandlerName, InputReadFd, OutputWriteFd, Binary, RequestId) :-
+    (   indexer_queue(Q)
+    ->  check_worker_alive(Q),
+        enqueue_pipe_work(Q, Request, HandlerModule, HandlerName, InputReadFd, OutputWriteFd, Binary, RequestId)
+    ;   json_log_error_formatted("dispatch_indexer_request: no indexer worker available", []),
+        throw(error(no_indexer_worker_available, _))
+    ).
+
+%% enqueue_pipe_work(+Queue, +RequestDict, +HandlerModule, +HandlerName,
+%%                   +InputReadFd, +OutputWriteFd, +Binary, +RequestId) is det.
+enqueue_pipe_work(Queue, Request, HandlerModule, HandlerName, InputReadFd, OutputWriteFd, Binary, RequestId) :-
+    thread_send_message(Queue, work(pipe(Request, HandlerModule, HandlerName, InputReadFd, OutputWriteFd, Binary, RequestId))).
 
 %% mark_worker_busy(+Queue) is det.
 %%
@@ -188,6 +292,77 @@ mark_worker_busy(Queue) :-
 mark_worker_ready(Alias) :-
     retractall(worker_busy(Alias, _)).
 
+%% register_active_pipe(+OutputWriteFd, +ThreadId) is det.
+%%
+%%  Record that the current worker thread is handling a request whose
+%%  output pipe has the given write FD. This allows cancel_pipe_request/1
+%%  to find and signal the thread when the client disconnects.
+register_active_pipe(OutputWriteFd, ThreadId) :-
+    register_active_pipe(OutputWriteFd, ThreadId, unknown).
+
+%% register_active_pipe(+OutputWriteFd, +ThreadId, +RequestId) is det.
+register_active_pipe(OutputWriteFd, ThreadId, RequestId) :-
+    (   worker(_, ThreadId, Alias)
+    ->  true
+    ;   Alias = unknown
+    ),
+    retractall(active_pipe(OutputWriteFd, _, _)),
+    retractall(active_pipe_request(OutputWriteFd, _)),
+    %% request entry first: active_pipe(Fd,_,_) must imply
+    %% active_pipe_request(Fd,_) so a matching-id cancel is never
+    %% misclassified as stale in the gap between the two asserts
+    assertz(active_pipe_request(OutputWriteFd, RequestId)),
+    assertz(active_pipe(OutputWriteFd, ThreadId, Alias)).
+
+%% unregister_active_pipe(+OutputWriteFd) is det.
+%%
+%%  Remove the active_pipe entry for this FD. Called during cleanup
+%%  in handle_pipe_work after the handler finishes (normally or via
+%%  exception). Idempotent — safe to call even if no entry exists.
+unregister_active_pipe(OutputWriteFd) :-
+    retractall(active_pipe(OutputWriteFd, _, _)),
+    retractall(active_pipe_request(OutputWriteFd, _)).
+
+%% cancel_pipe_request(+OutputWriteFd) is det.
+%%
+%%  Signal the worker thread handling the given output pipe FD that the
+%%  client has disconnected. The thread receives error(client_disconnected, _)
+%%  via thread_signal/2, which is delivered at the next goal boundary
+%%  (e.g. between PL_next_solution calls in a WOQL query loop).
+%%
+%%  If no active_pipe entry exists for the FD, this is a no-op — the
+%%  worker may have already finished and cleaned up.
+cancel_pipe_request(OutputWriteFd) :-
+    (   active_pipe(OutputWriteFd, ThreadId, _Alias)
+    ->  catch(thread_signal(ThreadId, throw(error(client_disconnected, _))),
+              _,
+              true),
+        json_log_error_formatted(
+            "Client disconnected, signalled worker thread ~w for pipe FD ~w",
+            [ThreadId, OutputWriteFd])
+    ;   true
+    ).
+
+%% cancel_pipe_request(+OutputWriteFd, +RequestId) is det.
+cancel_pipe_request(OutputWriteFd, RequestId) :-
+    with_mutex(pipe_health,
+        (   active_pipe(OutputWriteFd, ThreadId, _Alias)
+        ->  (   (   RequestId == unknown
+                ;   active_pipe_request(OutputWriteFd, RequestId)
+                )
+            ->  catch(thread_signal(ThreadId, throw(error(client_disconnected, _))),
+                      _,
+                      true),
+                json_log_error_formatted(
+                    "Client disconnected, signalled worker thread ~w for pipe FD ~w (request ~w)",
+                    [ThreadId, OutputWriteFd, RequestId])
+            ;   json_log_error_formatted(
+                    "Stale cancel for pipe FD ~w (request ~w) — FD now belongs to another request, ignored",
+                    [OutputWriteFd, RequestId])
+            )
+        ;   true
+        )).
+
 %% start_watchdog is det.
 %%
 %%  Start the watchdog thread if it is not already running. The watchdog
@@ -200,8 +375,7 @@ start_watchdog :-
         assertz(watchdog_queue(Q)),
         assertz(watchdog_running),
         thread_create(watchdog_loop(Q), _,
-                      [detached(false), alias(worker_watchdog),
-                       stack_limit(8_589_934_592)])
+                      [detached(false), alias(worker_watchdog)])
     ).
 
 %% signal_worker_ready(+Queue) is det.
@@ -228,13 +402,19 @@ signal_worker_ready(Queue) :-
 watchdog_loop(Queue) :-
     (   thread_get_message(Queue, Message, [timeout(5)])
     ->  (   Message = ready(Alias)
-        ->  mark_worker_ready(Alias)
-        ;   true
+        ->  mark_worker_ready(Alias),
+            Stop = false
+        ;   Message == stop
+        ->  Stop = true
+        ;   Stop = false
         )
-    ;   true  %% timeout — no messages, proceed to health check
+    ;   Stop = false
     ),
-    check_stuck_workers,
-    watchdog_loop(Queue).
+    (   Stop == true
+    ->  true
+    ;   check_stuck_workers,
+        watchdog_loop(Queue)
+    ).
 
 %% check_stuck_workers is det.
 %%
@@ -274,6 +454,67 @@ check_stuck_workers :-
         ),
         fail  %% backtrack to check all busy workers
     ;   true  %% no more busy workers
+    ),
+    check_pipe_health.
+
+%% check_pipe_health is det.
+%%
+%%  Safety net for pipe cancellation. For each active_pipe entry, verify
+%%  that the worker thread is still running. If the thread is dead but the
+%%  pipe entry persists (e.g. the thread died before cleanup ran), remove
+%%  the stale entry. If the thread is running, attempt a non-blocking write
+%%  of zero bytes to the output FD to check if the pipe is still writable.
+%%  If the pipe's read end has been closed (client disconnected), the write
+%%  will fail with EPIPE, and we signal the thread to abort.
+check_pipe_health :-
+    (   active_pipe(OutputWriteFd, ThreadId, Alias),
+        with_mutex(pipe_health,
+                   check_pipe_health_entry(OutputWriteFd, ThreadId, Alias)),
+        fail
+    ;   true
+    ).
+
+check_pipe_health_entry(OutputWriteFd, ThreadId, Alias) :-
+    (   active_pipe(OutputWriteFd, ThreadId, Alias)
+    ->  catch(thread_property(ThreadId, status(Status)), _, Status = not_found),
+        (   Status == running
+        ->  (   pipe_write_health_check(OutputWriteFd)
+            ->  true
+            ;   json_log_error_formatted(
+                    "Watchdog: pipe FD ~w (worker ~w, thread ~w) write check failed — signalling client_disconnected",
+                    [OutputWriteFd, Alias, ThreadId]),
+                cancel_pipe_request(OutputWriteFd),
+                %% A signalled dead pipe has served its purpose: keeping
+                %% the entry re-signals every pass into a stray-signal/
+                %% ready spin. Same entry only — a reused FD may hold a
+                %% newer request.
+                (   retract(active_pipe(OutputWriteFd, ThreadId, Alias))
+                ->  retractall(active_pipe_request(OutputWriteFd, _))
+                ;   true
+                )
+            )
+        ;   json_log_error_formatted(
+                "Watchdog: removing stale active_pipe entry for FD ~w (thread ~w is dead: ~w)",
+                [OutputWriteFd, ThreadId, Status]),
+            unregister_active_pipe(OutputWriteFd)
+        )
+    ;   true
+    ).
+
+%% pipe_write_health_check(+Fd) is semidet.
+%%
+%%  Attempt a zero-byte write to the pipe FD to check if the read end
+%%  is still open. On Unix, writing to a pipe with no readers raises
+%%  SIGPIPE (or returns EPIPE if SIGPIPE is blocked). We use catch/3
+%%  to detect this. A successful zero-byte write is a no-op on pipes.
+pipe_write_health_check(Fd) :-
+    catch(
+        (   '$appserver':appserver_open_fd_stream(Fd, write, octet, TestStream),
+            write(TestStream, ''),
+            close(TestStream)
+        ),
+        _Error,
+        fail
     ).
 
 %% worker_loop(+Queue) is det.
@@ -289,8 +530,27 @@ check_stuck_workers :-
 %%  the message queue orphaned and causing all subsequent requests
 %%  dispatched to this worker to hang forever.
 worker_loop(Queue) :-
+    catch(
+        worker_loop_iteration(Queue),
+        error(client_disconnected, _),
+        (   %% A stray cancel (late signal, stale active_pipe entry, or a
+            %% watchdog health check on a dead pipe) can deliver
+            %% client_disconnected outside the per-request catches — e.g.
+            %% while blocked in thread_get_message. That must not kill the
+            %% worker: a dead worker halts the server via the watchdog.
+            json_log_notice_formatted(
+                "Worker discarded stray client_disconnected signal", []),
+            catch(signal_worker_ready(Queue),
+                  error(client_disconnected, _), true)
+        )
+    ),
+    worker_loop(Queue).
+
+worker_loop_iteration(Queue) :-
     thread_get_message(Queue, Message),
-    (   Message = work(stream(Request, HandlerModule, HandlerName, InputStreamId, ResponseStreamId))
+    (   Message == shutdown
+    ->  thread_exit(shutdown)
+    ;   Message = work(stream(Request, HandlerModule, HandlerName, InputStreamId, ResponseStreamId))
     ->  log_worker_memory(before, HandlerModule, HandlerName),
         catch(
             (   handle_stream_work(Request, HandlerModule, HandlerName, InputStreamId, ResponseStreamId)
@@ -305,6 +565,7 @@ worker_loop(Queue) :-
         ),
         catch(
             (   cleanup_worker_state,
+                track_atom_growth,
                 log_worker_memory(after, HandlerModule, HandlerName)
             ),
             CleanupError,
@@ -312,23 +573,26 @@ worker_loop(Queue) :-
                 "Worker cleanup error (non-fatal, thread continues): ~q",
                 [CleanupError])
         ),
-        signal_worker_ready(Queue),
-        worker_loop(Queue)
-    ;   Message = work(pipe(Request, HandlerModule, HandlerName, InputReadFd, OutputWriteFd, Binary))
-    ->  log_worker_memory(before, HandlerModule, HandlerName),
-        catch(
-            (   handle_pipe_work(Request, HandlerModule, HandlerName, InputReadFd, OutputWriteFd, Binary)
+        signal_worker_ready(Queue)
+    ;   Message = work(pipe(Request, HandlerModule, HandlerName, InputReadFd, OutputWriteFd, Binary, RequestId))
+    ->  catch(
+            (   log_worker_memory(before, HandlerModule, HandlerName),
+                handle_pipe_work(Request, HandlerModule, HandlerName, InputReadFd, OutputWriteFd, Binary, RequestId)
             ->  true
             ;   json_log_error_formatted("Worker goal failed for ~w ~w", [HandlerModule, HandlerName]),
                 safe_write_cgi_error(OutputWriteFd, "Worker goal failed")
             ),
             Error,
-            (   json_log_error_formatted("Worker error: ~q", [Error]),
+            (   Error = error(client_disconnected, _)
+            ->  json_log_error_formatted(
+                    "Worker aborted: client disconnected (pipe FD ~w)", [OutputWriteFd])
+            ;   json_log_error_formatted("Worker error: ~q", [Error]),
                 safe_write_cgi_error(OutputWriteFd, Error)
             )
         ),
         catch(
             (   cleanup_worker_state,
+                track_atom_growth,
                 log_worker_memory(after, HandlerModule, HandlerName)
             ),
             CleanupError,
@@ -336,9 +600,8 @@ worker_loop(Queue) :-
                 "Worker cleanup error (non-fatal, thread continues): ~q",
                 [CleanupError])
         ),
-        signal_worker_ready(Queue),
-        worker_loop(Queue)
-    ;   worker_loop(Queue)
+        signal_worker_ready(Queue)
+    ;   true
     ).
 
 %% cleanup_worker_state is det.
@@ -354,8 +617,9 @@ worker_loop(Queue) :-
 %%  operation that requires ALL threads to reach a safe point — if
 %%  another worker is running a long query, garbage_collect_atoms blocks
 %%  until that worker yields. To avoid this, we only call
-%%  garbage_collect_atoms when the atom count exceeds a threshold,
-%%  rather than on every request.
+%%  garbage_collect_atoms when the atom count exceeds a threshold —
+%%  a suite mints ~16M atoms per run, so a low floor fires constantly
+%%  for little benefit.
 cleanup_worker_state :-
     get_time(T0),
     garbage_collect,
@@ -363,19 +627,49 @@ cleanup_worker_state :-
     trim_stacks,
     get_time(T2),
     (   statistics(atoms, AtomCount),
-        AtomCount > 50000
+        AtomCount > 75000
     ->  garbage_collect_atoms,
         get_time(T3),
         GCAtomTime is T3 - T2
-    ;   GCAtomTime = 0
+    ;   T3 = T2,
+        GCAtomTime = 0
     ),
+    statistics(atoms, AtomCount2),
+    % Private tables keyed by layer blobs pin Rust layer Arcs until
+    % abolished, so this must run unconditionally — not only above an atom
+    % threshold — or cached layers can never transition live -> dead.
+    abolish_private_tables,
+    get_time(T4),
+    TableGCTime is T4 - T3,
     GCTime is T1 - T0,
     TrimTime is T2 - T1,
     (   GCTime > 0.05
     ->  json_log_error_formatted(
-            "SLOW_GC: garbage_collect took ~3f seconds, trim_stacks took ~3f seconds, atom_gc took ~3f seconds, atoms=~w",
-            [GCTime, TrimTime, GCAtomTime, AtomCount])
+            "SLOW_GC: garbage_collect took ~3f seconds, trim_stacks took ~3f seconds, atom_gc took ~3f seconds, table_gc took ~3f seconds, atoms=~w",
+            [GCTime, TrimTime, GCAtomTime, TableGCTime, AtomCount2])
     ;   true
+    ).
+
+%% track_atom_growth(+BeforeCount, +AfterCount, +HandlerModule, +HandlerName)
+%%
+%%  Log when a single request creates more than 100 new atoms that survive
+%%  garbage_collect. This helps identify atom leakage sources.
+:- dynamic atom_count_before/2.  % atom_count_before(ThreadId, Count)
+track_atom_growth :-
+    thread_self(ThreadId),
+    (   atom_count_before(ThreadId, Before)
+    ->  statistics(atoms, After),
+        Growth is After - Before,
+        (   Growth > 100
+        ->  json_log_debug_formatted(
+                "ATOM_GROWTH: ~w new atoms survived GC (before=~w, after=~w)",
+                [Growth, Before, After])
+        ;   true
+        ),
+        retractall(atom_count_before(ThreadId, _)),
+        assertz(atom_count_before(ThreadId, After))
+    ;   statistics(atoms, Current),
+        assertz(atom_count_before(ThreadId, Current))
     ).
 
 %% log_worker_memory(+Phase, +HandlerModule, +HandlerName) is det.
@@ -404,46 +698,71 @@ log_worker_memory(Phase, HandlerModule, HandlerName) :-
 %%  dispatches via http_dispatch_with_expansion. The response is captured
 %%  and sent to the output stream.
 %%
-%%  For stream handlers (HandlerName == stream_handler), the ResponseStreamId
-%%  is made available so that ndjson streaming can use it.
+%%  Two paths:
+%%    - Buffered: parsed_body present (Content-Length set). Drain input stream,
+%%      build SWI request, call handler with body or parsed_body.
+%%    - Raw streaming: no parsed_body (chunked transfer). Pass input_stream_id
+%%      to handler via Request dict. Handler drains chunks itself via
+%%      appserver_stream_recv/2, enabling true incremental streaming.
 handle_stream_work(Request, HandlerModule, HandlerName, InputStreamId, ResponseStreamId) :-
+    (   \+ get_dict(parsed_body, Request, _)
+    ->  handle_stream_work_raw(Request, HandlerModule, HandlerName, InputStreamId, ResponseStreamId)
+    ;   handle_stream_work_buffered(Request, HandlerModule, HandlerName, InputStreamId, ResponseStreamId)
+    ).
+
+%% Raw streaming path: skip drain, pass input_stream_id to handler.
+%% Handler reads chunks via appserver_stream_recv/2 and can interleave
+%% reads with response sends for true streaming.
+handle_stream_work_raw(Request, HandlerModule, HandlerName, InputStreamId, ResponseStreamId) :-
+    put_dict(input_stream_id, Request, InputStreamId, RequestWithStream),
+    handle_plugin_stream_request(HandlerModule, HandlerName, RequestWithStream, _NoSWIRequest, ResponseStreamId, Response),
+    finish_stream_response(Response, ResponseStreamId).
+
+%% Buffered path: drain input stream into memory file, build SWI request,
+%% inject body string into Request dict for plugin handlers.
+handle_stream_work_buffered(Request, HandlerModule, HandlerName, InputStreamId, ResponseStreamId) :-
     drain_input_stream(InputStreamId, MemoryFile, BodyStream, BodyLen),
     setup_call_cleanup(
         true,
         (   build_swi_request_from_dict(Request, BodyStream, BodyLen, SWIRequest),
-            (   HandlerName == stream_handler
-            ->  handle_stream_request(Request, SWIRequest, ResponseStreamId, Response)
-            ;   handle_plugin_stream_request(HandlerModule, HandlerName, Request, SWIRequest, ResponseStreamId, Response)
-            ),
-            %% Extract post_response goal before serializing — it's a
-            %% Prolog goal, not JSON serializable.
-            (   get_dict(post_response, Response, PostResponseGoal)
-            ->  select_dict(_{post_response:PostResponseGoal}, Response, ResponseClean),
-                HasPostResponse = true
-            ;   ResponseClean = Response,
-                HasPostResponse = false
-            ),
-            send_response(ResponseStreamId, ResponseClean),
-            (   get_dict(body, ResponseClean, stream),
-                get_dict('_ndjson_body', ResponseClean, Body)
-            ->  thread_create(
-                    tdb_http_handler:stream_ndjson_body(Body, ResponseStreamId),
-                    _,
-                    [detached(true)]
-                )
+            (   BodyLen > 0
+            ->  read_string(BodyStream, _, BodyString),
+                b_set_dict(body, Request, BodyString)
             ;   true
             ),
-            %% Call the post_response goal after sending headers. The goal
-            %% sends initial data via appserver_stream_send and registers
-            %% for live updates. It runs on the worker thread.
-            (   HasPostResponse == true
-            ->  call(PostResponseGoal)
-            ;   true
-            )
+            handle_plugin_stream_request(HandlerModule, HandlerName, Request, SWIRequest, ResponseStreamId, Response),
+            finish_stream_response(Response, ResponseStreamId)
         ),
         (   catch(close(BodyStream), _, true),
             catch(free_memory_file(MemoryFile), _, true)
         )
+    ).
+
+%% finish_stream_response(+Response, +ResponseStreamId) is det.
+%%
+%%  Extract non-serializable fields (post_response, _sync_queue) from the
+%%  response dict, send the response metadata to Rust, signal the sync
+%%  queue, and call the post_response goal if present.
+finish_stream_response(Response, ResponseStreamId) :-
+    (   get_dict(post_response, Response, PostResponseGoal)
+    ->  select_dict(_{post_response:PostResponseGoal}, Response, ResponseClean),
+        HasPostResponse = true
+    ;   ResponseClean = Response,
+        HasPostResponse = false
+    ),
+    (   get_dict('_sync_queue', ResponseClean, SyncQueue)
+    ->  select_dict(_{'_sync_queue':SyncQueue}, ResponseClean, ResponseClean1)
+    ;   ResponseClean1 = ResponseClean,
+        SyncQueue = none
+    ),
+    send_response(ResponseStreamId, ResponseClean1),
+    (   SyncQueue \= none
+    ->  thread_send_message(SyncQueue, go)
+    ;   true
+    ),
+    (   HasPostResponse == true
+    ->  call(PostResponseGoal)
+    ;   true
     ).
 
 %% handle_pipe_work(+Request, +HandlerModule, +HandlerName,
@@ -452,46 +771,142 @@ handle_stream_work(Request, HandlerModule, HandlerName, InputStreamId, ResponseS
 %%  Process a single plugin request through OS pipes. The input pipe is drained
 %%  into a memory file, the SWI request is built, and the handler runs with a
 %%  CGI stream writing directly to the output pipe.
-handle_pipe_work(Request, _HandlerModule, _HandlerName, InputReadFd, OutputWriteFd, Binary) :-
+handle_pipe_work(Request, HandlerModule, HandlerName, InputReadFd, OutputWriteFd, Binary) :-
+    handle_pipe_work(Request, HandlerModule, HandlerName, InputReadFd, OutputWriteFd, Binary, unknown).
+
+%% handle_pipe_work(+Request, +HandlerModule, +HandlerName, +InputReadFd,
+%%                  +OutputWriteFd, +Binary, +RequestId) is det.
+handle_pipe_work(Request, HandlerModule, HandlerName, InputReadFd, OutputWriteFd, Binary, RequestId) :-
     (   Binary == true -> WriteEnc = octet ; WriteEnc = utf8 ),
+    thread_self(ThreadId),
     setup_call_cleanup(
         (   (   InputReadFd >= 0
             ->  '$appserver':appserver_open_fd_stream(InputReadFd, read, octet, InStream),
                 drain_pipe_to_memory_file(InStream, MemoryFile, BodyStream, BodyLen)
             ;   empty_body_stream(MemoryFile, BodyStream, BodyLen)
             ),
-            '$appserver':appserver_open_fd_stream(OutputWriteFd, write, WriteEnc, OutStream)
+            '$appserver':appserver_open_fd_stream(OutputWriteFd, write, WriteEnc, OutStream),
+            %% Register last so a setup throw cannot leak an entry the
+            %% watchdog would re-signal forever.
+            register_active_pipe(OutputWriteFd, ThreadId, RequestId)
         ),
         (   build_swi_request_from_dict(Request, BodyStream, BodyLen, SWIRequest),
-            catch(
-                (   cgi_open(OutStream, CGI, srv_http:cgi_capture_hook, [request(SWIRequest)]),
-                    setup_call_cleanup(
-                        (   Binary == true
-                        ->  set_stream(CGI, encoding(octet))
-                        ;   set_stream(CGI, encoding(utf8))
-                        ),
-                        with_output_to(CGI,
-                            tdb_http_handler:http_dispatch_with_expansion(SWIRequest)),
-                        close(CGI)
-                    )
-                ->  true
-                ;   write_cgi_error(OutStream, 500, "Handler goal failed")
+            (   HandlerModule == tdb_http_handler,
+                HandlerName == rust_handler
+            ->  catch(
+                    (   cgi_open(OutStream, CGI, srv_http:cgi_capture_hook, [request(SWIRequest)]),
+                        cgi_property(CGI, id(Local_Id)),
+                        setup_call_cleanup(
+                            (   Binary == true
+                            ->  set_stream(CGI, encoding(octet))
+                            ;   set_stream(CGI, encoding(utf8))
+                            ),
+                            with_output_to(CGI,
+                                tdb_http_handler:http_dispatch_with_expansion(SWIRequest)),
+                            close(CGI)
+                        )
+                    ->  true
+                    ;   catch(write_cgi_error(OutStream, 500, "Handler goal failed"), _, true)
+                    ),
+                    Error,
+                    handle_handler_error(Error, OutStream, CGI)
                 ),
-                Error,
-                handle_handler_error(Error, OutStream, CGI)
+                % Clean up this request's saved_request/5 fact, asserted by
+                % http:request_expansion/2 during handler execution.
+                % In the SWI-Prolog HTTP server, this is done via
+                % http(request_finished(...)) broadcast events, but the
+                % Rust backend does not emit those events.
+                retractall_saved_request_for_request(Local_Id)
+            ;   HandlerModule == indexer_worker
+            ->  catch(
+                    (   indexer_worker:indexer_process_commit_handler(Request, OutStream)
+                    ->  true
+                    ;   handle_worker_error(OutStream, "Indexer worker handler failed")
+                    ),
+                    Error,
+                    (   json_log_error_formatted("Indexer worker handler error: ~q", [Error]),
+                        catch(handle_worker_error(OutStream, Error), _, true)
+                    )
+                )
+            ;   catch(
+                    call_raw_plugin_handler(HandlerModule, HandlerName, Request, OutStream),
+                    Error,
+                    (   json_log_error_formatted("Raw plugin handler error: ~q", [Error]),
+                        catch(handle_worker_error(OutStream, Error), _, true)
+                    )
+                )
             )
         ),
-        (   catch(close(OutStream), _, true),
-            (   InputReadFd >= 0 -> catch(close(InStream), _, true) ; true ),
-            catch(close(BodyStream), _, true),
-            catch(free_memory_file(MemoryFile), _, true),
-            %% Safety net: close/1 on a stream may fail to close the
-            %% underlying FD if flushing buffered data encounters an error
-            %% (e.g. broken pipe). Explicitly close the FDs to prevent leaks.
-            catch('$appserver':appserver_close_fd(OutputWriteFd), _, true),
-            (   InputReadFd >= 0 -> catch('$appserver':appserver_close_fd(InputReadFd), _, true) ; true )
-        )
+        release_pipe_resources(OutStream, InStream, BodyStream, MemoryFile, OutputWriteFd, InputReadFd)
     ).
+
+%% release_pipe_resources(+OutStream, +InStream, +BodyStream,
+%%                        +MemoryFile, +OutputWriteFd, +InputReadFd) is det.
+release_pipe_resources(OutStream, InStream, BodyStream, MemoryFile, OutputWriteFd, InputReadFd) :-
+    (   %% unregister before close: a registered FD must be open
+        with_mutex(pipe_health, unregister_active_pipe(OutputWriteFd)),
+        catch(close(OutStream), _, true),
+        (   InputReadFd >= 0 -> catch(close(InStream), _, true) ; true ),
+        catch(close(BodyStream), _, true),
+        catch(free_memory_file(MemoryFile), _, true),
+        %% Safety net: close/1 on a stream may fail to close the
+        %% underlying FD if flushing buffered data encounters an error
+        %% (e.g. broken pipe). Explicitly close the FDs to prevent leaks.
+        catch('$appserver':appserver_close_fd(OutputWriteFd), _, true),
+        (   InputReadFd >= 0 -> catch('$appserver':appserver_close_fd(InputReadFd), _, true) ; true )
+    ).
+
+%% retractall_saved_request_for_request(+Local_Id) is det.
+%%
+%%  Remove the saved_request/5 fact of the request identified by Local_Id
+%%  (the CGI stream id). Cleanup is scoped per request: workers run
+%%  concurrently, so a global retractall would delete facts of in-flight
+%%  requests and strip api:trace_id from their error responses.
+retractall_saved_request_for_request(Local_Id) :-
+    (   var(Local_Id)
+    ->  true
+    ;   retractall(saved_request(Local_Id, _, _, _, _))
+    ).
+
+%% call_raw_plugin_handler(+Module, +Handler, +Request, +OutStream) is det.
+%%
+%%  Call a raw plugin handler (arity 2: +Request, -Response) and write
+%%  the response dict as CGI headers + body to the output stream.
+%%  The response dict has keys: status (integer), body (string), headers (dict).
+call_raw_plugin_handler(Module, Handler, Request, OutStream) :-
+    Goal =.. [Handler, Request, Response],
+    call(Module:Goal),
+    (   is_dict(Response)
+    ->  write_plugin_response(OutStream, Response)
+    ;   json_log_error_formatted("Raw plugin handler ~w:~w/2 did not return a dict: ~q", [Module, Handler, Response]),
+        write_cgi_error(OutStream, 500, "Plugin handler did not return a dict")
+    ).
+
+%% write_plugin_response(+Stream, +Response) is det.
+%%
+%%  Write a plugin response dict as CGI headers + body.
+%%  Response has keys: status (integer, default 200), body (string, default ""),
+%%  headers (dict, optional).
+write_plugin_response(Stream, Response) :-
+    (   get_dict(status, Response, Status)
+    ->  true
+    ;   Status = 200
+    ),
+    (   get_dict(body, Response, Body)
+    ->  true
+    ;   Body = ""
+    ),
+    (   get_dict(headers, Response, Headers)
+    ->  true
+    ;   Headers = _{}
+    ),
+    format(Stream, 'Status: ~w\n', [Status]),
+    (   get_dict('Content-Type', Headers, ContentType)
+    ->  format(Stream, 'Content-Type: ~w\n', [ContentType])
+    ;   true
+    ),
+    format(Stream, '\n', []),
+    format(Stream, '~s', [Body]).
 
 %% drain_input_stream(+InputStreamId, -MemoryFile, -BodyStream, -BodyLen) is det.
 %%
@@ -521,24 +936,17 @@ drain_chunks(InputStreamId, WriteStream, AccLen, TotalLen) :-
 %%  Read all bytes from the input pipe stream into a memory file with octet
 %%  encoding, then reopen the memory file for reading. The pipe is closed by
 %%  the caller after this predicate returns.
+%%
+%%  Uses copy_stream_data/2 for bulk C-level buffered I/O instead of
+%%  byte-at-a-time Prolog recursion. For a 2KB request body this reduces
+%%  ~2000 recursive Prolog calls to a single C call.
 drain_pipe_to_memory_file(InStream, MemoryFile, BodyStream, BodyLen) :-
     new_memory_file(MemoryFile),
     open_memory_file(MemoryFile, write, WriteStream, [type(binary), encoding(octet)]),
-    drain_pipe_bytes(InStream, WriteStream, 0, BodyLen),
+    copy_stream_data(InStream, WriteStream),
     close(WriteStream),
+    size_memory_file(MemoryFile, BodyLen),
     open_memory_file(MemoryFile, read, BodyStream, [type(binary), encoding(octet)]).
-
-drain_pipe_bytes(InStream, WriteStream, AccLen, TotalLen) :-
-    (   at_end_of_stream(InStream)
-    ->  TotalLen = AccLen
-    ;   get_byte(InStream, Byte),
-        (   Byte == -1
-        ->  TotalLen = AccLen
-        ;   put_byte(WriteStream, Byte),
-            NewLen is AccLen + 1,
-            drain_pipe_bytes(InStream, WriteStream, NewLen, TotalLen)
-        )
-    ).
 
 %% empty_body_stream(-MemoryFile, -BodyStream, -BodyLen) is det.
 %%
@@ -624,106 +1032,45 @@ handle_plugin_request(SWIRequest, Response) :-
 %%  signature is Handler(+RequestDict, +StreamId, -Response). The request
 %%  dict is the original JSON request from Rust (with params, query, etc.).
 handle_plugin_stream_request(HandlerModule, HandlerName, Request, _SWIRequest, ResponseStreamId, Response) :-
+    (   get_dict(path, Request, PathString)
+    ->  atom_string(GatePath, PathString)
+    ;   GatePath = ''),
     Goal =.. [HandlerName, Request, ResponseStreamId, Response],
     catch(
-        (   call(HandlerModule:Goal)
-        ->  true
-        ;   json_log_error_formatted("Plugin stream handler ~w:~w failed", [HandlerModule, HandlerName]),
-            Response = _{
-                status: 500,
-                body: _{
-                    '@type': 'api:ErrorResponse',
-                    'api:status': 'api:failure',
-                    'api:error': _{'@type': 'api:InternalServerError'},
-                    'api:message': 'Internal server error'
-                },
-                headers: _{'Content-Type': 'application/json'}
-            }
-        ),
-        Error,
-        (   json_log_error_formatted("Plugin stream handler ~w:~w error: ~q", [HandlerModule, HandlerName, Error]),
-            Response = _{
-                status: 500,
-                body: _{
-                    '@type': 'api:ErrorResponse',
-                    'api:status': 'api:failure',
-                    'api:error': _{'@type': 'api:InternalServerError'},
-                    'api:message': 'Internal server error'
-                },
-                headers: _{'Content-Type': 'application/json'}
-            }
-        )
-    ).
-
-%% handle_stream_request(+RequestDict, +SWIRequest, +ResponseStreamId, -Response) is det.
-%%
-%%  Dispatch the SWI request through the HTTP pipeline, capture the output,
-%%  and if the body is NDJSON, return body: stream and spawn a detached
-%%  thread to push lines to the Rust stream.
-handle_stream_request(_Request, SWIRequest, _ResponseStreamId, Response) :-
-    catch(
-        (   capture_http_output(SWIRequest,
-                               tdb_http_handler:http_dispatch_with_expansion(SWIRequest),
-                               Captured),
-            parse_http_response(Captured, Response0),
-            Response0 = _{status: Status, body: Body, headers: Headers},
-            (   string(Body),
-                tdb_http_handler:ndjson_body(Body)
-            ->  Response = _{status: Status, body: stream, headers: Headers, '_ndjson_body': Body}
-            ;   Response = Response0
+        (   store_ready_for(GatePath)
+        ->  (   call(HandlerModule:Goal)
+            ->  true
+            ;   json_log_error_formatted("Plugin stream handler ~w:~w failed", [HandlerModule, HandlerName]),
+                plugin_api:plugin_error_response(failure, Response)
             )
-        ->  true
-        ;   json_log_error_formatted("Stream handler goal failed", []),
-            Response = _{
-                status: 500,
-                body: _{
-                    '@type': 'api:ErrorResponse',
-                    'api:status': 'api:failure',
-                    'api:error': _{'@type': 'api:InternalServerError'},
-                    'api:message': 'Internal server error'
-                },
-                headers: _{'Content-Type': 'application/json'}
-            }
+        ;   throw(error(server_not_ready, _))
         ),
         Error,
-        (   json_log_error_formatted("Stream handler failed: ~q", [Error]),
-            Response = _{
-                status: 500,
-                body: _{
-                    '@type': 'api:ErrorResponse',
-                    'api:status': 'api:failure',
-                    'api:error': _{'@type': 'api:InternalServerError'},
-                    'api:message': 'Internal server error'
-                },
-                headers: _{'Content-Type': 'application/json'}
-            }
+        (   Error = error(server_not_ready, _)
+        ->  plugin_api:plugin_error_response(Error, Response)
+        ;   json_log_error_formatted("Plugin stream handler ~w:~w error: ~q", [HandlerModule, HandlerName, Error]),
+            plugin_api:plugin_error_response(Error, Response)
         )
     ).
 
 %% send_response(+ResponseStreamId, +Response) is det.
 %%
 %%  Serialize the response dict as JSON and send it to the output stream.
-%%  When the body is 'stream', the stream is left open for the spawned
-%%  NDJSON thread to write to and close.
 %%
 %%  For binary content types (e.g. application/octets), the body is sent
 %%  as a separate raw byte message after the JSON metadata, using
 %%  appserver_stream_send_raw/2 which preserves 8-bit clean data.
 send_response(ResponseStreamId, Response) :-
-    (   get_dict('_ndjson_body', Response, _)
-    ->  select_dict(_{'_ndjson_body':_}, Response, ResponseClean)
-    ;   ResponseClean = Response
-    ),
-    (   is_binary_response(ResponseClean)
-    ->  get_dict(body, ResponseClean, Body),
-        select_dict(_{body:Body}, ResponseClean, ResponseMeta),
+    (   is_binary_response(Response)
+    ->  get_dict(body, Response, Body),
+        select_dict(_{body:Body}, Response, ResponseMeta),
         with_output_to(string(JsonString), json_write_dict(current_output, ResponseMeta, [as(string)])),
         '$appserver':appserver_stream_send(ResponseStreamId, JsonString),
         '$appserver':appserver_stream_send_raw(ResponseStreamId, Body),
         '$appserver':appserver_stream_close(ResponseStreamId)
-    ;   with_output_to(string(JsonString), json_write_dict(current_output, ResponseClean, [as(string)])),
+    ;   with_output_to(string(JsonString), json_write_dict(current_output, Response, [as(string)])),
         '$appserver':appserver_stream_send(ResponseStreamId, JsonString),
-        (   get_dict(body, ResponseClean, stream)
+        (   get_dict(body, Response, stream)
         ->  true
         ;   '$appserver':appserver_stream_close(ResponseStreamId)
         )
@@ -803,6 +1150,31 @@ cgi_headers_sent(CGI) :-
     catch(cgi_property(CGI, header_codes(Codes)), _, fail),
     Codes \= [].
 
+%% handle_worker_error(+OutStream, +Error) is det.
+%%
+%%  Handle a handler exception from a worker pipe. Unlike
+%%  handle_handler_error/3 which uses a CGI stream, this works with a
+%%  raw output stream. If data has already been written to the stream
+%%  (headers sent), append an error banner to the body to avoid
+%%  corrupting the response with a second set of CGI headers; otherwise
+%%  write a fresh CGI error response.
+handle_worker_error(OutStream, Error) :-
+    (   stream_has_output(OutStream)
+    ->  catch(format(OutStream, '~n~n############# ERROR #################~n', []), _, true),
+        catch(write_cgi_error_body(OutStream, Error), _, true)
+    ;   catch(write_cgi_error(OutStream, 500, Error), _, true)
+    ).
+
+%% stream_has_output(+Stream) is semidet.
+%%
+%%  True if the stream has had any data written to it. Used to determine
+%%  whether CGI headers have already been sent to a raw output stream.
+stream_has_output(Stream) :-
+    catch((flush_output(Stream),
+           stream_property(Stream, position('$stream_position'(ByteCount, _, _, _)))),
+          _, fail),
+    ByteCount > 0.
+
 %% open_fd_for_error(+Fd, -Stream) is semidet.
 %%
 %%  Best-effort attempt to open the output FD as a UTF-8 stream for writing an
@@ -846,6 +1218,10 @@ send_error_response(ResponseStreamId, Error) :-
     ;   '$appserver':appserver_stream_close(ResponseStreamId)
     ).
 
+%% Test helper for call_raw_plugin_handler unit test.
+test_raw_handler(_Request, Response) :-
+    Response = _{status: 200, body: "test response body", headers: _{'Content-Type': 'text/plain'}}.
+
 :- begin_tests(request_worker_pool, [concurrent(false)]).
 
 %% Suppress SWI-Prolog's "Thread running ... died on exception" warnings
@@ -868,6 +1244,31 @@ test(write_cgi_error_body_format) :-
                    write_cgi_error_body(current_output, "Oops")),
     assertion(sub_string(Result, _, _, _, '############# ERROR #################')),
     assertion(sub_string(Result, _, _, _, '"api:message":"Oops"')).
+
+test(write_plugin_response_default_status) :-
+    with_output_to(string(Result),
+                   write_plugin_response(current_output, _{body: "hello", headers: _{'Content-Type': 'text/plain'}})),
+    assertion(sub_string(Result, _, _, _, 'Status: 200')),
+    assertion(sub_string(Result, _, _, _, 'Content-Type: text/plain')),
+    assertion(sub_string(Result, _, _, _, 'hello')).
+
+test(write_plugin_response_custom_status) :-
+    with_output_to(string(Result),
+                   write_plugin_response(current_output, _{status: 404, body: "not found", headers: _{'Content-Type': 'application/json'}})),
+    assertion(sub_string(Result, _, _, _, 'Status: 404')),
+    assertion(sub_string(Result, _, _, _, 'not found')).
+
+test(write_plugin_response_no_headers) :-
+    with_output_to(string(Result),
+                   write_plugin_response(current_output, _{status: 201, body: "created"})),
+    assertion(sub_string(Result, _, _, _, 'Status: 201')),
+    assertion(sub_string(Result, _, _, _, 'created')).
+
+test(call_raw_plugin_handler_calls_handler) :-
+    with_output_to(string(Result),
+                   call_raw_plugin_handler(request_worker_pool, test_raw_handler, _{}, current_output)),
+    assertion(sub_string(Result, _, _, _, 'Status: 200')),
+    assertion(sub_string(Result, _, _, _, 'test response body')).
 
 test(empty_body_stream_zero_length) :-
     empty_body_stream(MemoryFile, BodyStream, 0),
@@ -1091,6 +1492,38 @@ test(drain_pipe_to_memory_file_japanese_utf8) :-
     ),
     drain_pipe_to_memory_file(InStream, MemoryFile, BodyStream, BodyLen),
     assertion(BodyLen == 9),
+    setup_call_cleanup(
+        true,
+        (   read_string(BodyStream, _, BodyText),
+            string_codes(BodyText, Codes),
+            assertion(Codes == Bytes)
+        ),
+        (   close(BodyStream),
+            close(InStream),
+            catch(close(Read), _, true),
+            free_memory_file(MemoryFile)
+        )
+    ).
+
+test(drain_pipe_to_memory_file_large_payload) :-
+    %% 10000 bytes: alternating pattern to verify no data corruption
+    %% at scale. This would be 10000 recursive Prolog calls with the
+    %% old byte-at-a-time implementation.
+    findall(B, ( between(1, 10000, I),
+                 B is (I mod 256) ), Bytes),
+    pipe(Read, Write),
+    set_stream(Write, encoding(octet)),
+    stream_property(Read, file_no(ReadFd)),
+    '$appserver':appserver_open_fd_stream(ReadFd, read, octet, InStream),
+    setup_call_cleanup(
+        open_string(Bytes, Src),
+        (   copy_stream_data(Src, Write),
+            close(Write)
+        ),
+        close(Src)
+    ),
+    drain_pipe_to_memory_file(InStream, MemoryFile, BodyStream, BodyLen),
+    assertion(BodyLen == 10000),
     setup_call_cleanup(
         true,
         (   read_string(BodyStream, _, BodyText),
@@ -1361,7 +1794,7 @@ test(cleanup_worker_state_runs_gc_and_trim) :-
     %% trim_stacks/0 without errors. It must always succeed
     %% (it is called between every request in the worker loop).
     %% garbage_collect_atoms/0 is only called when atom count
-    %% exceeds 50000 to avoid blocking other threads on every request.
+    %% exceeds 75000 to avoid blocking other threads on every request.
     cleanup_worker_state.
 
 test(cleanup_worker_state_is_det) :-
@@ -1385,6 +1818,21 @@ test(cleanup_worker_state_reduces_atom_count) :-
     assertion(After =< Before + 500),
     %% Clean up the nb_setval references
     nb_delete(temp).
+
+% Private-tabled probe for cleanup_worker_state_abolishes_private_tables.
+:- table rwp_table_probe/1 as private.
+rwp_table_probe(marker).
+
+test(cleanup_worker_state_abolishes_private_tables) :-
+    %% Private tables keyed by layer blobs pin the underlying Rust layer
+    %% Arc until the table is abolished. Worker threads must therefore
+    %% clear private tables after every request, not only when the atom
+    %% count crosses a threshold — otherwise cached layers can never
+    %% transition live -> dead and the cache grows without bound.
+    rwp_table_probe(_),
+    assertion(current_table(rwp_table_probe(_), _)),
+    cleanup_worker_state,
+    assertion(\+ current_table(rwp_table_probe(_), _)).
 
 %% --- Watchdog mechanism ---
 
@@ -1495,4 +1943,589 @@ test(watchdog_grace_period_env_positive,
     watchdog_grace_period(P),
     assertion(P == 120).
 
+test(handle_pipe_work_indexer_worker_receives_dict_not_swi_request,
+     []) :-
+    %% Regression: the indexer_worker branch must pass the Request dict
+    %% (which has .path and .query as dict keys) to the handler, not the
+    %% SWIRequest list (which is a list of key-value pairs like
+    %% [method(post), path('/api'), ...]).  Passing the list caused
+    %% type_error(dict, [method(post), ...]) because the handler calls
+    %% get_dict/3 which requires a dict.
+    Request = _{method: "POST", path: "admin/db/local/branch/main",
+                 query: "branch=main&commit=abc123",
+                 headers: _{}},
+    %% The handler expects get_dict(path, Request, _) to succeed.
+    assertion(get_dict(path, Request, _)),
+    assertion(get_dict(query, Request, _)),
+    %% A SWI request list causes a type error from get_dict/3 (not
+    %% uniform failure), so we verify via catch/3.
+    SWIRequest = [method(post), path('admin/db/local/branch/main'),
+                  search([branch=main, commit=abc123])],
+    catch(get_dict(path, SWIRequest, _),
+          error(type_error(dict, _), _),
+          true).
+
+%% --- Pipe cancellation on client disconnect ---
+
+test(active_pipe_registered_during_handle_pipe_work) :-
+    %% When handle_pipe_work starts, it should register active_pipe/3
+    %% linking the output FD to the current thread. We verify by
+    %% calling register_active_pipe/2 directly and checking the fact.
+    retractall(request_worker_pool:active_pipe(_, _, _)),
+    thread_self(ThreadId),
+    request_worker_pool:register_active_pipe(999, ThreadId),
+    assertion(request_worker_pool:active_pipe(999, ThreadId, _)),
+    request_worker_pool:unregister_active_pipe(999),
+    \+ request_worker_pool:active_pipe(999, _, _).
+
+test(cancel_pipe_request_signals_worker_thread) :-
+    %% cancel_pipe_request/1 should find the thread for a given FD
+    %% and send it a thread_signal/2 with a client_disconnected exception.
+    retractall(request_worker_pool:active_pipe(_, _, _)),
+    message_queue_create(TestQ),
+    thread_create(
+        ( thread_self(Self),
+          request_worker_pool:register_active_pipe(777, Self),
+          thread_get_message(TestQ, _)
+        ),
+        ThreadId,
+        [detached(false), alias(test_cancel_pipe)]
+    ),
+    %% Wait for registration
+    sleep(0.1),
+    assertion(request_worker_pool:active_pipe(777, ThreadId, _)),
+    %% Cancel the pipe — this signals the thread
+    with_quiet_user_error(request_worker_pool:cancel_pipe_request(777)),
+    %% The thread should receive the signal and eventually exit
+    %% (the signal throws in the thread)
+    thread_join(ThreadId, _),
+    message_queue_destroy(TestQ),
+    retractall(request_worker_pool:active_pipe(_, _, _)).
+
+test(cancel_pipe_request_noop_for_unknown_fd) :-
+    %% Cancelling an unknown FD should succeed silently.
+    retractall(request_worker_pool:active_pipe(_, _, _)),
+    request_worker_pool:cancel_pipe_request(12345),
+    true.
+
+test(unregister_active_pipe_is_idempotent) :-
+    %% Unregistering a non-existent pipe should not throw.
+    retractall(request_worker_pool:active_pipe(_, _, _)),
+    request_worker_pool:unregister_active_pipe(99999),
+    true.
+
+test(worker_loop_catches_client_disconnected) :-
+    %% The worker_loop catch/3 must catch error(client_disconnected, _)
+    %% and continue to the next iteration without dying.
+    retractall(request_worker_pool:active_pipe(_, _, _)),
+    message_queue_create(TestQ),
+    message_queue_create(ReadyQ),
+    thread_create(
+        ( catch(
+              throw(error(client_disconnected, _)),
+              Error,
+              (   Error = error(client_disconnected, _)
+              ->  true
+              ;   throw(Error)
+              )
+            ),
+          %% If we reach here, the exception was caught
+          thread_send_message(ReadyQ, caught),
+          thread_get_message(TestQ, _)
+        ),
+        ThreadId,
+        [detached(false), alias(test_catch_disconnect)]
+    ),
+    thread_get_message(ReadyQ, caught),
+    catch(thread_property(ThreadId, status(Status)), _, Status = not_found),
+    assertion(Status == running),
+    thread_send_message(TestQ, done),
+    thread_join(ThreadId, _),
+    message_queue_destroy(TestQ),
+    message_queue_destroy(ReadyQ).
+
+test(worker_loop_survives_stray_client_disconnected) :-
+    %% A client_disconnected signal delivered while the worker is blocked
+    %% in thread_get_message (e.g. a late cancel on a stale active_pipe
+    %% entry) must not kill the worker — a dead worker crashes the server
+    %% via the watchdog.
+    message_queue_create(TestQ),
+    thread_create(request_worker_pool:worker_loop(TestQ), ThreadId,
+                  [detached(false)]),
+    sleep(0.2),
+    thread_signal(ThreadId, throw(error(client_disconnected, _))),
+    sleep(0.2),
+    catch(thread_property(ThreadId, status(Status)), _, Status = not_found),
+    assertion(Status == running),
+    %% Other exceptions remain fatal: the worker must still die on a
+    %% different signal so the watchdog can crash the server.
+    thread_signal(ThreadId, throw(error(test_thread_death(stray_signal), _))),
+    thread_join(ThreadId,
+                exception(error(test_thread_death(stray_signal), _))),
+    message_queue_destroy(TestQ).
+
+%% --- Pipe cleanup ordering (watchdog race regression) ---
+
+test(closed_registered_fd_is_seen_as_disconnect) :-
+    %% Safety net: a closed-but-registered FD still reads as a disconnect.
+    retractall(request_worker_pool:active_pipe(_, _, _)),
+    message_queue_create(Sig),
+    tmp_file_stream(Tmp, S, [encoding(utf8)]),
+    stream_property(S, file_no(Fd)),
+    thread_create(
+        catch((   thread_send_message(Sig, ready),
+                  sleep(5)
+              ),
+              error(client_disconnected, _),
+              thread_send_message(Sig, signaled)),
+        Worker, [detached(false)]),
+    thread_get_message(Sig, Ready, [timeout(5)]),
+    assertion(Ready == ready),
+    request_worker_pool:register_active_pipe(Fd, Worker),
+    close(S),
+    delete_file(Tmp),
+    with_quiet_user_error(request_worker_pool:check_pipe_health),
+    thread_get_message(Sig, Result, [timeout(5)]),
+    assertion(Result == signaled),
+    thread_join(Worker, _),
+    message_queue_destroy(Sig),
+    retractall(request_worker_pool:active_pipe(_, _, _)).
+
+test(unregistered_fd_close_never_signals) :-
+    retractall(request_worker_pool:active_pipe(_, _, _)),
+    nb_setval(test_got_disconnect2, false),
+    thread_self(Self),
+    tmp_file_stream(Tmp, S, [encoding(utf8)]),
+    stream_property(S, file_no(Fd)),
+    request_worker_pool:register_active_pipe(Fd, Self),
+    request_worker_pool:unregister_active_pipe(Fd),
+    close(S),
+    delete_file(Tmp),
+    catch(
+        (   forall(between(1, 50, _),
+                   request_worker_pool:check_pipe_health),
+            sleep(0)
+        ),
+        error(client_disconnected, _),
+        nb_setval(test_got_disconnect2, true)
+    ),
+    assertion(\+ nb_getval(test_got_disconnect2, true)),
+    nb_delete(test_got_disconnect2),
+    retractall(request_worker_pool:active_pipe(_, _, _)).
+
+test(check_pipe_health_entry_skips_removed_entry) :-
+    retractall(request_worker_pool:active_pipe(_, _, _)),
+    nb_setval(test_got_disconnect3, false),
+    thread_self(Self),
+    tmp_file_stream(Tmp, S, [encoding(utf8)]),
+    stream_property(S, file_no(Fd)),
+    close(S),
+    delete_file(Tmp),
+    catch(
+        (   request_worker_pool:check_pipe_health_entry(Fd, Self, test_alias),
+            sleep(0)
+        ),
+        error(client_disconnected, _),
+        nb_setval(test_got_disconnect3, true)
+    ),
+    assertion(\+ nb_getval(test_got_disconnect3, true)),
+    nb_delete(test_got_disconnect3),
+    retractall(request_worker_pool:active_pipe(_, _, _)).
+
+test(handle_pipe_work_setup_failure_leaves_no_active_pipe,
+     [cleanup((retractall(request_worker_pool:active_pipe(_, _, _)),
+               retractall(request_worker_pool:active_pipe_request(_, _))))]) :-
+    %% A setup-phase failure in handle_pipe_work must not leak an
+    %% active_pipe/3 entry — a stale entry spins the watchdog and the
+    %% worker in a stray-signal/ready loop. Both fds are opened then
+    %% closed so their numbers stay distinct.
+    tmp_file_stream(Tmp1, S1, [encoding(utf8)]),
+    stream_property(S1, file_no(InFd)),
+    tmp_file_stream(Tmp2, S2, [encoding(utf8)]),
+    stream_property(S2, file_no(OutFd)),
+    close(S1),
+    close(S2),
+    ignore(catch(
+        request_worker_pool:handle_pipe_work(
+            _{method:"POST", path:"/", headers:_{}},
+            mod, handler, InFd, OutFd, false, req_leak),
+        _Error,
+        true)),
+    assertion(\+ request_worker_pool:active_pipe(OutFd, _, _)),
+    delete_file(Tmp1),
+    delete_file(Tmp2).
+
+test(signalled_dead_pipe_is_unregistered,
+     [cleanup((retractall(request_worker_pool:active_pipe(_, _, _)),
+               retractall(request_worker_pool:active_pipe_request(_, _))))]) :-
+    %% A dead pipe never recovers, so the entry must go with the signal —
+    %% keeping it re-signals on every health pass.
+    message_queue_create(Sig),
+    tmp_file_stream(Tmp, S, [encoding(utf8)]),
+    stream_property(S, file_no(Fd)),
+    thread_create(
+        catch((   thread_send_message(Sig, ready),
+                  sleep(5)
+              ),
+              error(client_disconnected, _),
+              thread_send_message(Sig, signaled)),
+        Worker, [detached(false)]),
+    thread_get_message(Sig, Ready, [timeout(5)]),
+    assertion(Ready == ready),
+    request_worker_pool:register_active_pipe(Fd, Worker),
+    close(S),
+    delete_file(Tmp),
+    with_quiet_user_error(request_worker_pool:check_pipe_health),
+    thread_get_message(Sig, Result, [timeout(5)]),
+    assertion(Result == signaled),
+    assertion(\+ request_worker_pool:active_pipe(Fd, _, _)),
+    thread_join(Worker, _),
+    message_queue_destroy(Sig).
+
+test(pipe_registration_visible_during_request,
+     [cleanup((retractall(request_worker_pool:active_pipe(_, _, _)),
+               retractall(request_worker_pool:active_pipe_request(_, _)),
+               catch(message_queue_destroy(test_pipe_reg_probe_q), _, true)))]) :-
+    %% The entry must be visible while the handler runs — registration
+    %% still covers the request — and gone once cleanup has run.
+    message_queue_create(test_pipe_reg_probe_q),
+    pipe(Read, Write),
+    stream_property(Write, file_no(OutFd)),
+    thread_create(
+        request_worker_pool:handle_pipe_work(
+            _{method:"GET", path:"/", headers:_{}},
+            request_worker_pool, test_pipe_reg_probe,
+            -1, OutFd, false, reg_probe),
+        Worker, [detached(false)]),
+    thread_get_message(test_pipe_reg_probe_q, seen(SeenFd), [timeout(5)]),
+    assertion(SeenFd == OutFd),
+    thread_join(Worker, _),
+    assertion(\+ request_worker_pool:active_pipe(OutFd, _, _)),
+    message_queue_destroy(test_pipe_reg_probe_q),
+    catch(close(Read), _, true),
+    catch(close(Write), _, true).
+
+test(pipe_health_mutex_blocks_fd_close) :-
+    retractall(request_worker_pool:active_pipe(_, _, _)),
+    thread_self(Self),
+    tmp_file_stream(Tmp, S, [encoding(utf8)]),
+    stream_property(S, file_no(Fd)),
+    request_worker_pool:register_active_pipe(Fd, Self),
+    empty_body_stream(MemoryFile, BodyStream, _),
+    message_queue_create(DoneQ),
+    thread_create(
+        (   request_worker_pool:release_pipe_resources(
+                S, none, BodyStream, MemoryFile, Fd, -1),
+            thread_send_message(DoneQ, done)
+        ),
+        Worker,
+        [detached(false)]
+    ),
+    with_mutex(pipe_health,
+        (   sleep(0.2),
+            assertion(request_worker_pool:pipe_write_health_check(Fd)),
+            assertion(request_worker_pool:active_pipe(Fd, Self, _))
+        )),
+    thread_get_message(DoneQ, done, [timeout(5)]),
+    thread_join(Worker, _),
+    \+ request_worker_pool:active_pipe(Fd, _, _),
+    assertion(\+ request_worker_pool:pipe_write_health_check(Fd)),
+    message_queue_destroy(DoneQ),
+    delete_file(Tmp).
+
+%% --- Request-ID correlated cancellation ---
+
+test(cancel_pipe_request_matching_id_signals) :-
+    retractall(request_worker_pool:active_pipe(_, _, _)),
+    retractall(request_worker_pool:active_pipe_request(_, _)),
+    message_queue_create(Ctl),
+    message_queue_create(Sig),
+    tmp_file_stream(Tmp, S, [encoding(utf8)]),
+    stream_property(S, file_no(Fd)),
+    thread_create(
+        catch((   thread_send_message(Sig, ready),
+                  thread_get_message(Ctl, _)
+              ),
+              error(client_disconnected, _),
+              thread_send_message(Sig, signaled)),
+        Worker, [detached(false)]),
+    request_worker_pool:register_active_pipe(Fd, Worker, 'req-A'),
+    close(S),
+    delete_file(Tmp),
+    thread_get_message(Sig, Ready, [timeout(5)]),
+    assertion(Ready == ready),
+    with_quiet_user_error(request_worker_pool:cancel_pipe_request(Fd, 'req-A')),
+    thread_get_message(Sig, Result, [timeout(5)]),
+    assertion(Result == signaled),
+    thread_join(Worker, _),
+    message_queue_destroy(Ctl),
+    message_queue_destroy(Sig),
+    retractall(request_worker_pool:active_pipe(_, _, _)),
+    retractall(request_worker_pool:active_pipe_request(_, _)).
+
+test(cancel_pipe_request_mismatched_id_no_signal) :-
+    retractall(request_worker_pool:active_pipe(_, _, _)),
+    retractall(request_worker_pool:active_pipe_request(_, _)),
+    message_queue_create(Ctl),
+    message_queue_create(Sig),
+    tmp_file_stream(Tmp, S, [encoding(utf8)]),
+    stream_property(S, file_no(Fd)),
+    thread_create(
+        catch((   thread_send_message(Sig, ready),
+                  thread_get_message(Ctl, _)
+              ),
+              error(client_disconnected, _),
+              thread_send_message(Sig, signaled)),
+        Worker, [detached(false)]),
+    request_worker_pool:register_active_pipe(Fd, Worker, 'req-A'),
+    close(S),
+    delete_file(Tmp),
+    thread_get_message(Sig, Ready, [timeout(5)]),
+    assertion(Ready == ready),
+    with_quiet_user_error(request_worker_pool:cancel_pipe_request(Fd, 'req-B')),
+    sleep(0.2),
+    thread_send_message(Ctl, done),
+    thread_join(Worker, _),
+    assertion(\+ thread_get_message(Sig, _, [timeout(0)])),
+    message_queue_destroy(Ctl),
+    message_queue_destroy(Sig),
+    retractall(request_worker_pool:active_pipe(_, _, _)),
+    retractall(request_worker_pool:active_pipe_request(_, _)).
+
+test(fd_reuse_cancel_hits_only_owning_request) :-
+    retractall(request_worker_pool:active_pipe(_, _, _)),
+    retractall(request_worker_pool:active_pipe_request(_, _)),
+    message_queue_create(Ctl),
+    message_queue_create(Sig),
+    tmp_file_stream(Tmp, S, [encoding(utf8)]),
+    stream_property(S, file_no(Fd)),
+    thread_create(
+        catch((   thread_send_message(Sig, ready),
+                  thread_get_message(Ctl, _)
+              ),
+              error(client_disconnected, _),
+              thread_send_message(Sig, signaled)),
+        Worker, [detached(false)]),
+    request_worker_pool:register_active_pipe(Fd, Worker, 'req-A'),
+    request_worker_pool:unregister_active_pipe(Fd),
+    request_worker_pool:register_active_pipe(Fd, Worker, 'req-B'),
+    close(S),
+    delete_file(Tmp),
+    thread_get_message(Sig, Ready, [timeout(5)]),
+    assertion(Ready == ready),
+    with_quiet_user_error(request_worker_pool:cancel_pipe_request(Fd, 'req-A')),
+    sleep(0.2),
+    assertion(\+ thread_get_message(Sig, _, [timeout(0)])),
+    with_quiet_user_error(request_worker_pool:cancel_pipe_request(Fd, 'req-B')),
+    thread_get_message(Sig, Result, [timeout(5)]),
+    assertion(Result == signaled),
+    thread_join(Worker, _),
+    message_queue_destroy(Ctl),
+    message_queue_destroy(Sig),
+    retractall(request_worker_pool:active_pipe(_, _, _)),
+    retractall(request_worker_pool:active_pipe_request(_, _)).
+
+test(handle_worker_error_no_output) :-
+    %% When no data has been written to the stream, handle_worker_error
+    %% should produce a full CGI error response with headers.
+    tmp_file_stream(Tmp, Stream, [encoding(utf8)]),
+    handle_worker_error(Stream, "test error"),
+    close(Stream),
+    read_file_to_string(Tmp, Result, []),
+    delete_file(Tmp),
+    assertion(sub_string(Result, _, _, _, 'Status: 500')),
+    assertion(sub_string(Result, _, _, _, 'Content-Type: application/json')),
+    assertion(sub_string(Result, _, _, _, '"api:message":"test error"')).
+
+test(handle_worker_error_with_output) :-
+    %% When data has already been written to the stream, handle_worker_error
+    %% should append an error banner, NOT write new CGI headers.
+    tmp_file_stream(Tmp, Stream, [encoding(utf8)]),
+    format(Stream, 'Status: 200~nContent-Type: text/plain~n~npartial body', []),
+    handle_worker_error(Stream, "late failure"),
+    close(Stream),
+    read_file_to_string(Tmp, Result, []),
+    delete_file(Tmp),
+    %% Original content preserved
+    assertion(sub_string(Result, _, _, _, 'Status: 200')),
+    assertion(sub_string(Result, _, _, _, 'partial body')),
+    %% Error banner appended, NOT a second Status header from write_cgi_error
+    assertion(sub_string(Result, _, _, _, '############# ERROR #################')),
+    assertion(sub_string(Result, _, _, _, '"api:message":"late failure"')),
+    %% Ensure there is no "Status: 500" from write_cgi_error
+    assertion(\+ sub_string(Result, _, _, _, 'Status: 500')).
+
+test(stream_has_output_fresh_stream) :-
+    tmp_file_stream(Tmp, Stream, [encoding(utf8)]),
+    assertion(\+ stream_has_output(Stream)),
+    close(Stream),
+    delete_file(Tmp).
+
+test(stream_has_output_after_write) :-
+    tmp_file_stream(Tmp, Stream, [encoding(utf8)]),
+    format(Stream, 'hello', []),
+    assertion(stream_has_output(Stream)),
+    close(Stream),
+    delete_file(Tmp).
+
+test(handle_handler_error_no_headers_sent) :-
+    %% When CGI headers haven't been sent yet, handle_handler_error
+    %% should write a fresh CGI error response.
+    tmp_file_stream(Tmp, OutStream, [encoding(utf8)]),
+    cgi_open(OutStream, CGI, srv_http:cgi_capture_hook, [request([])]),
+    handle_handler_error("test error", OutStream, CGI),
+    catch(close(CGI), _, true),
+    close(OutStream),
+    read_file_to_string(Tmp, Result, []),
+    delete_file(Tmp),
+    assertion(sub_string(Result, _, _, _, 'Status: 500')).
+
+test(call_raw_plugin_handler_with_dict_passes_payload_and_path) :-
+    Request = _{method: "POST", path: "/api/graphql-ws/test/db/local/branch/main",
+                query: "", headers: _{},
+                payload: _{query: "subscription { Person_added { _id } }"}},
+    with_output_to(string(Result),
+        call_raw_plugin_handler(request_worker_pool, test_dict_handler, Request, current_output)),
+    assertion(sub_string(Result, _, _, _, 'Status: 200')),
+    assertion(sub_string(Result, _, _, _, '"has_payload":true')),
+    assertion(sub_string(Result, _, _, _, '/api/graphql-ws/test/db/local/branch/main')).
+
+test(call_raw_plugin_handler_with_dict_missing_payload) :-
+    Request = _{method: "POST", path: "/api/test", query: "", headers: _{}},
+    with_output_to(string(Result),
+        call_raw_plugin_handler(request_worker_pool, test_dict_handler, Request, current_output)),
+    assertion(sub_string(Result, _, _, _, 'Status: 200')),
+    assertion(sub_string(Result, _, _, _, '"has_payload":false')).
+
+test("plugin stream request returns 503 while the store is initializing",
+     [setup((readiness:reset_readiness,
+             setenv('TERMINUSDB_READINESS_TIMEOUT', '0.2'),
+             readiness:readiness_pending(store))),
+      cleanup((unsetenv('TERMINUSDB_READINESS_TIMEOUT'),
+               readiness:reset_readiness))]) :-
+    handle_plugin_stream_request(request_worker_pool, test_stream_probe,
+                                 _{path: "/api/plugin/x"}, [], _StreamId, Response),
+    assertion(Response.status == 503),
+    assertion(Response.body.'api:status' == 'api:service_unavailable').
+
+test("plugin stream request dispatches once the store is ready",
+     [setup(readiness:reset_readiness), cleanup(readiness:reset_readiness)]) :-
+    handle_plugin_stream_request(request_worker_pool, test_stream_probe,
+                                 _{path: "/api/plugin/x"}, [], _StreamId, Response),
+    assertion(Response.status == 200).
+
+test(saved_request_cleanup_removes_only_owning_request,
+     [cleanup(retractall(json_log:saved_request(_, _, _, _, _)))]) :-
+    assert(json_log:saved_request(req_a, 1.0, '/a', some(op_a), [])),
+    assert(json_log:saved_request(req_b, 1.0, '/b', some(op_b), [])),
+    retractall_saved_request_for_request(req_a),
+    assertion(\+ json_log:saved_request(req_a, _, _, _, _)),
+    assertion(json_log:saved_request(req_b, _, _, _, _)).
+
+test(saved_request_cleanup_tolerates_unbound_id,
+     [cleanup(retractall(json_log:saved_request(_, _, _, _, _)))]) :-
+    assert(json_log:saved_request(req_a, 1.0, '/a', some(op_a), [])),
+    retractall_saved_request_for_request(_Unbound),
+    assertion(json_log:saved_request(req_a, _, _, _, _)).
+
+test(init_creates_indexer_worker_outside_round_robin) :-
+    stop_request_worker_pool,
+    init_request_worker_pool(2),
+    findall(Q, request_worker_pool:round_robin_queue(Q), Ordinary),
+    assertion(length(Ordinary, 2)),
+    indexer_queue(IndexerQ),
+    request_worker_pool:worker(IndexerQ, IndexerT, indexer_worker_1),
+    catch(thread_property(IndexerT, status(S)), _, S = not_found),
+    assertion(S == running),
+    assertion(\+ memberchk(IndexerQ, Ordinary)),
+    assertion(\+ request_worker_pool:round_robin_queue(IndexerQ)),
+    stop_request_worker_pool.
+
+test(enqueue_pipe_work_delivers_exact_term) :-
+    message_queue_create(Q),
+    enqueue_pipe_work(Q, _{method:"POST"}, mod, handler, 10, 11, true, req7),
+    thread_get_message(Q, work(pipe(R, M, H, I, O, B, Id))),
+    assertion(R =@= _{method:"POST"}),
+    assertion((M, H, I, O, B, Id) =@= (mod, handler, 10, 11, true, req7)),
+    message_queue_destroy(Q).
+
+test(dispatch_indexer_request_does_not_mark_busy) :-
+    stop_request_worker_pool,
+    init_request_worker_pool(1),
+    retractall(request_worker_pool:worker_busy(_, _)),
+    dispatch_indexer_request(_{method:"POST"}, mod, handler, 9998, 9999,
+                             false, idx_req1),
+    assertion(\+ request_worker_pool:worker_busy(indexer_worker_1, _)),
+    sleep(0.1),
+    assertion(\+ request_worker_pool:worker_busy(indexer_worker_1, _)),
+    stop_request_worker_pool.
+
+test(dispatch_request_marks_busy_on_ordinary_workers_only) :-
+    %% No watchdog in this hand-built pool, so the busy mark persists
+    %% instead of racing signal_worker_ready's drain.
+    stop_request_worker_pool,
+    retractall(request_worker_pool:worker_busy(_, _)),
+    message_queue_create(Q),
+    thread_create(worker_loop(Q), T,
+                  [detached(false), alias(test_rr_worker)]),
+    assertz(request_worker_pool:round_robin_queue(Q)),
+    assertz(request_worker_pool:worker(Q, T, test_rr_worker)),
+    message_queue_create(IQ),
+    thread_create(worker_loop(IQ), IT,
+                  [detached(false), alias(test_idx_alias)]),
+    assertz(request_worker_pool:indexer_queue(IQ)),
+    assertz(request_worker_pool:worker(IQ, IT, indexer_worker_1)),
+    dispatch_request(_{method:"GET"}, mod, handler, 9998, 9999, false),
+    assertion(request_worker_pool:worker_busy(test_rr_worker, _)),
+    assertion(\+ request_worker_pool:worker_busy(indexer_worker_1, _)),
+    stop_request_worker_pool.
+
+test(dispatch_indexer_request_fails_loud_without_pool,
+     [throws(error(no_indexer_worker_available, _))]) :-
+    stop_request_worker_pool,
+    dispatch_indexer_request(_{method:"POST"}, mod, handler, 1, 2, false, req).
+
+test(stop_request_worker_pool_is_idempotent) :-
+    stop_request_worker_pool,
+    init_request_worker_pool(1),
+    stop_request_worker_pool,
+    assertion(\+ request_worker_pool:round_robin_queue(_)),
+    assertion(\+ request_worker_pool:indexer_queue(_)),
+    assertion(\+ request_worker_pool:worker(_, _, _)),
+    assertion(\+ request_worker_pool:watchdog_running),
+    stop_request_worker_pool.
+
 :- end_tests(request_worker_pool).
+
+%% Test handler for pipe_registration_visible_during_request: records
+%% whether this thread's active_pipe entry is visible mid-request.
+%% Defined outside the test block so call_raw_plugin_handler can resolve it.
+test_pipe_reg_probe(_Request, Response) :-
+    thread_self(Self),
+    (   active_pipe(Fd, Self, _)
+    ->  Seen = Fd
+    ;   Seen = none
+    ),
+    thread_send_message(test_pipe_reg_probe_q, seen(Seen)),
+    Response = _{status: 200, body: "{}", headers: _{}}.
+
+%% Test handler that echoes back fields from the Request dict.
+%% Defined outside the test block so call_raw_plugin_handler can resolve it.
+test_dict_handler(Request, Response) :-
+    (   get_dict(payload, Request, _)
+    ->  HasPayload = true
+    ;   HasPayload = false
+    ),
+    (   get_dict(path, Request, Path)
+    ->  true
+    ;   Path = ""
+    ),
+    with_output_to(string(Body),
+        json_write_dict(current_output,
+            _{path: Path, has_payload: HasPayload},
+            [as(string), width(0)])),
+    Response = _{status: 200, body: Body, headers: _{'Content-Type': 'application/json'}}.
+
+%% Test stream handler for handle_plugin_stream_request tests.
+test_stream_probe(_Request, _StreamId, Response) :-
+    Response = _{status: 200, body: _{}, headers: _{}}.

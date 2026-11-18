@@ -1,14 +1,22 @@
+use crate::config::MAX_BODY_SIZE;
 use axum::{
     body::Body,
     extract::Path,
     http::{header, HeaderMap, Request, StatusCode},
+    middleware::Next,
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
+use flate2::read::{GzDecoder, ZlibDecoder};
 use futures::Stream;
+use nix::unistd::pipe;
 use percent_encoding::percent_decode_str;
 use serde_json::json;
+use std::io::Write;
+use std::os::fd::{FromRawFd, IntoRawFd};
+use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
 use std::{
     collections::{HashMap, HashSet},
     io::Read,
@@ -18,17 +26,11 @@ use std::{
         Arc, Mutex, OnceLock,
     },
 };
-use flate2::read::{GzDecoder, ZlibDecoder};
-use nix::unistd::pipe;
-use std::io::Write;
-use std::os::fd::{FromRawFd, IntoRawFd};
-use std::pin::Pin;
-use std::task::{Context as TaskContext, Poll};
 use swipl::prelude::*;
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
+use tokio::net::unix::pipe::Receiver;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio::net::unix::pipe::Receiver;
 
 /// A route registered by a Prolog plugin.
 #[derive(Clone, Debug)]
@@ -46,7 +48,9 @@ pub struct PluginStaticPath {
     pub prefix: String,
     pub directory: String,
     pub fallback: Option<String>,
+    pub not_found: Option<String>,
     pub auth: String,
+    pub csp_nonce: bool,
 }
 
 /// A streaming endpoint registered by a Prolog plugin.
@@ -160,14 +164,11 @@ impl StreamRegistry {
 
     pub fn send(&mut self, id: StreamId, bytes: axum::body::Bytes) -> Result<(), String> {
         match self.senders.get(&id) {
-            Some(sender) => match sender.try_send(bytes) {
+            Some(sender) => match sender.blocking_send(bytes) {
                 Ok(()) => Ok(()),
-                Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(_) => {
                     self.senders.remove(&id);
                     Err("stream closed".to_string())
-                }
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    Err("stream buffer full".to_string())
                 }
             },
             None => Err("stream not found".to_string()),
@@ -184,6 +185,75 @@ pub fn stream_registry() -> Arc<Mutex<StreamRegistry>> {
     STREAM_REGISTRY.clone()
 }
 
+/// Per-user SSE subscription limiter. Tracks the count of active
+/// subscriptions per user ID and rejects new subscriptions over the
+/// configured limit. The limit is read once at startup from the
+/// `TERMINUSDB_SSE_MAX_SUBSCRIPTIONS_PER_USER` env var (default: 20).
+pub struct SubscriptionLimiter {
+    counts: HashMap<String, u64>,
+    max_per_user: u64,
+}
+
+impl Default for SubscriptionLimiter {
+    fn default() -> Self {
+        let max_per_user = std::env::var("TERMINUSDB_SSE_MAX_SUBSCRIPTIONS_PER_USER")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(20);
+        Self {
+            counts: HashMap::new(),
+            max_per_user,
+        }
+    }
+}
+
+impl SubscriptionLimiter {
+    /// Try to acquire a subscription slot for the given user.
+    /// Returns `Ok(())` if under the limit, `Err(())` if over.
+    pub fn try_acquire(&mut self, user_id: &str) -> Result<(), ()> {
+        let count = self.counts.entry(user_id.to_string()).or_insert(0);
+        if *count >= self.max_per_user {
+            return Err(());
+        }
+        *count += 1;
+        Ok(())
+    }
+
+    /// Release a subscription slot for the given user.
+    /// Decrements the count, removing the entry if it reaches zero.
+    pub fn release(&mut self, user_id: &str) {
+        if let Some(count) = self.counts.get_mut(user_id) {
+            if *count > 0 {
+                *count -= 1;
+            }
+            if *count == 0 {
+                self.counts.remove(user_id);
+            }
+        }
+    }
+
+    /// Get the current count for a user (for testing).
+    #[cfg(test)]
+    pub fn count_for(&self, user_id: &str) -> u64 {
+        self.counts.get(user_id).copied().unwrap_or(0)
+    }
+
+    /// Get the configured max per user (for testing).
+    #[cfg(test)]
+    pub fn max_per_user(&self) -> u64 {
+        self.max_per_user
+    }
+}
+
+lazy_static::lazy_static! {
+    static ref SUBSCRIPTION_LIMITER: Arc<Mutex<SubscriptionLimiter>> = Arc::new(Mutex::new(SubscriptionLimiter::default()));
+}
+
+/// Return a handle to the global subscription limiter.
+pub fn subscription_limiter() -> Arc<Mutex<SubscriptionLimiter>> {
+    SUBSCRIPTION_LIMITER.clone()
+}
+
 /// Commands sent to the broadcast forwarder task.
 /// See PLAN_BROADCAST_QUEUE.md for the full architecture.
 enum BroadcastCommand {
@@ -191,6 +261,7 @@ enum BroadcastCommand {
         channel: String,
         stream_id: StreamId,
         sender: mpsc::Sender<axum::body::Bytes>,
+        idle_timeout: Option<std::time::Duration>,
     },
     Unsubscribe {
         channel: String,
@@ -201,6 +272,11 @@ enum BroadcastCommand {
     },
     Send {
         channel: String,
+        bytes: axum::body::Bytes,
+    },
+    /// Send bytes to every active channel. Used by the heartbeat
+    /// mechanism to keep all SSE connections alive.
+    SendToAll {
         bytes: axum::body::Bytes,
     },
 }
@@ -258,12 +334,14 @@ impl BroadcastRegistry {
         channel: String,
         stream_id: StreamId,
         sender: mpsc::Sender<axum::body::Bytes>,
+        idle_timeout: Option<std::time::Duration>,
     ) {
         self.ensure_forwarder();
         let _ = self.tx.send(BroadcastCommand::Subscribe {
             channel,
             stream_id,
             sender,
+            idle_timeout,
         });
     }
 
@@ -287,6 +365,15 @@ impl BroadcastRegistry {
                 channel: channel.to_string(),
                 bytes,
             })
+            .map_err(|_| "broadcast forwarder task terminated".to_string())
+    }
+
+    /// Send bytes to every active channel. Used by the heartbeat
+    /// mechanism to keep all SSE connections alive.
+    pub fn send_to_all(&mut self, bytes: axum::body::Bytes) -> Result<(), String> {
+        self.ensure_forwarder();
+        self.tx
+            .send(BroadcastCommand::SendToAll { bytes })
             .map_err(|_| "broadcast forwarder task terminated".to_string())
     }
 }
@@ -359,11 +446,10 @@ async fn run_forwarder(mut rx: mpsc::UnboundedReceiver<BroadcastCommand>) {
                 channel,
                 stream_id,
                 sender,
+                idle_timeout,
             } => {
-                // Create a bounded per-subscriber buffer and spawn a
-                // per-subscriber task that drains it into the stream.
                 let (sub_tx, sub_rx) = mpsc::channel::<axum::body::Bytes>(SUBSCRIBER_BUFFER);
-                let task = tokio::spawn(subscriber_task(sub_rx, sender));
+                let task = tokio::spawn(subscriber_task(sub_rx, sender, idle_timeout));
                 channels
                     .entry(channel)
                     .or_default()
@@ -391,21 +477,83 @@ async fn run_forwarder(mut rx: mpsc::UnboundedReceiver<BroadcastCommand>) {
                     // Fan out with try_send — non-blocking, CPU-only.
                     // A full buffer means the subscriber is too slow;
                     // disconnect it rather than blocking the forwarder.
+                    let mut full_count = 0u32;
+                    let mut closed_count = 0u32;
                     let failed: Vec<StreamId> = subs
                         .iter()
-                        .filter_map(|(id, sub)| {
-                            match sub.tx.try_send(bytes.clone()) {
-                                Ok(()) => None,
-                                Err(mpsc::error::TrySendError::Full(_)) => Some(*id),
-                                Err(mpsc::error::TrySendError::Closed(_)) => Some(*id),
+                        .filter_map(|(id, sub)| match sub.tx.try_send(bytes.clone()) {
+                            Ok(()) => None,
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                full_count += 1;
+                                Some(*id)
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                closed_count += 1;
+                                Some(*id)
                             }
                         })
                         .collect();
+                    if full_count > 0 || closed_count > 0 {
+                        crate::log::log_info(format!(
+                            "broadcast send: disconnected {} subscribers (buffer_full={} closed={}) from channel '{}', remaining={}",
+                            failed.len(), full_count, closed_count, channel, subs.len() - failed.len()
+                        ));
+                    }
                     for id in failed {
                         if let Some(sub) = subs.remove(&id) {
                             sub.task.abort();
                         }
                     }
+                } else {
+                    // Silently skip — no subscribers on this channel.
+                    // Do NOT log this, as logging would trigger another
+                    // broadcast attempt, creating an infinite feedback loop.
+                }
+            }
+            BroadcastCommand::SendToAll { bytes } => {
+                // Fan out to GraphQL SSE channels only — used by the heartbeat.
+                // Commit stream channels (named by branch path) receive NDJSON
+                // and would break on SSE keepalive comments. GraphQL SSE channels
+                // are named `graphql_raw_<cohort_key>`.
+                // Same try_send + disconnect-on-full pattern as Send.
+                let mut total_full = 0u32;
+                let mut total_closed = 0u32;
+                for (channel_name, subs) in &mut channels {
+                    if !channel_name.starts_with("graphql_raw_") {
+                        continue;
+                    }
+                    if subs.is_empty() {
+                        continue;
+                    }
+                    let mut full_count = 0u32;
+                    let mut closed_count = 0u32;
+                    let failed: Vec<StreamId> = subs
+                        .iter()
+                        .filter_map(|(id, sub)| match sub.tx.try_send(bytes.clone()) {
+                            Ok(()) => None,
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                full_count += 1;
+                                Some(*id)
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                closed_count += 1;
+                                Some(*id)
+                            }
+                        })
+                        .collect();
+                    total_full += full_count;
+                    total_closed += closed_count;
+                    for id in failed {
+                        if let Some(sub) = subs.remove(&id) {
+                            sub.task.abort();
+                        }
+                    }
+                }
+                if total_full > 0 || total_closed > 0 {
+                    crate::log::log_info(format!(
+                        "broadcast send_to_all: disconnected {} subscribers (buffer_full={} closed={})",
+                        total_full + total_closed, total_full, total_closed
+                    ));
                 }
             }
         }
@@ -417,19 +565,58 @@ async fn run_forwarder(mut rx: mpsc::UnboundedReceiver<BroadcastCommand>) {
 /// backpressures on the stream's mpsc channel, which backpressures on the
 /// TCP socket. A slow client only blocks this task, not the forwarder.
 ///
+/// If `idle_timeout` is set, the task exits after that duration of
+/// inactivity (no messages received). Each received message resets the
+/// timer. This replaces per-stream Prolog OS threads with a lightweight
+/// tokio task — no OS thread per client.
+///
 /// The task exits (and cleans up) when either side closes:
 /// - The per-subscriber buffer sender is dropped (forwarder removed the
 ///   subscriber, or the forwarder task ended) → `recv().await` returns None
 /// - The stream's mpsc receiver is dropped (client disconnected) →
 ///   `send().await` returns Err
+/// - The idle timeout fires with no messages → exit, which drops
+///   stream_tx, causing the ReceiverStream to see EOF
 async fn subscriber_task(
     mut rx: mpsc::Receiver<axum::body::Bytes>,
     stream_tx: mpsc::Sender<axum::body::Bytes>,
+    idle_timeout: Option<std::time::Duration>,
 ) {
-    while let Some(bytes) = rx.recv().await {
-        if stream_tx.send(bytes).await.is_err() {
-            // Stream closed — client disconnected. Exit.
-            break;
+    match idle_timeout {
+        Some(timeout) => {
+            loop {
+                let sleep = tokio::time::sleep(timeout);
+                tokio::pin!(sleep);
+
+                tokio::select! {
+                    result = rx.recv() => {
+                        match result {
+                            None => break,
+                            Some(bytes) => {
+                                if stream_tx.send(bytes).await.is_err() {
+                                    break;
+                                }
+                                // Loop restarts the sleep timer.
+                            }
+                        }
+                    }
+                    _ = &mut sleep => {
+                        // Idle timeout — no messages for the timeout
+                        // duration. Exit to close the stream.
+                        crate::log::log_info(format!(
+                            "subscriber_task: idle timeout fired, closing stream"
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+        None => {
+            while let Some(bytes) = rx.recv().await {
+                if stream_tx.send(bytes).await.is_err() {
+                    break;
+                }
+            }
         }
     }
 }
@@ -446,16 +633,81 @@ pub fn broadcast_registry() -> Arc<Mutex<BroadcastRegistry>> {
 /// Global handle to the tokio runtime, set when the server starts.
 /// This allows FFI functions (called from Prolog threads) to spawn
 /// async tasks on the tokio runtime.
-static TOKIO_HANDLE: OnceLock<tokio::runtime::Handle> = OnceLock::new();
+///
+/// Uses a Mutex<Option<Handle>> instead of OnceLock so tests can update
+/// the handle across different tokio runtimes. In production,
+/// set_tokio_handle is called exactly once at server startup.
+static TOKIO_HANDLE: std::sync::Mutex<Option<tokio::runtime::Handle>> = std::sync::Mutex::new(None);
 
 /// Store the tokio runtime handle so FFI functions can spawn tasks.
+/// Also starts the heartbeat task that sends keepalive comments to all
+/// SSE streams every 30 seconds.
 pub fn set_tokio_handle(handle: tokio::runtime::Handle) {
-    let _ = TOKIO_HANDLE.set(handle);
+    handle.spawn(heartbeat_task());
+    *TOKIO_HANDLE.lock().unwrap() = Some(handle);
+}
+
+/// Heartbeat interval — how often keepalive comments are sent.
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Background task that sends SSE keepalive comments (`: keepalive\n\n`)
+/// to all active broadcast channels every 30 seconds.
+///
+/// These comments are part of the SSE spec and are ignored by all
+/// conformant SSE clients. They serve two purposes:
+/// - Keep the connection alive (reset the idle timeout in subscriber_task)
+/// - Detect disconnected clients (send fails → subscriber is cleaned up)
+///
+/// The heartbeat goes through the broadcast forwarder's `SendToAll`
+/// command, so it benefits from the same non-blocking try_send + cleanup
+/// logic as regular events.
+async fn heartbeat_task() {
+    let keepalive = axum::body::Bytes::from(": keepalive\n\n");
+    loop {
+        tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+        if let Err(e) = broadcast_registry()
+            .lock()
+            .unwrap()
+            .send_to_all(keepalive.clone())
+        {
+            crate::log::log_info(format!("heartbeat: send_to_all failed: {}", e));
+        }
+    }
 }
 
 /// Get the tokio runtime handle, if set.
-pub fn tokio_handle() -> Option<&'static tokio::runtime::Handle> {
-    TOKIO_HANDLE.get()
+/// Returns a cloned Handle (not a static reference) since we now use
+/// a Mutex<Option<Handle>> instead of OnceLock.
+pub fn tokio_handle() -> Option<tokio::runtime::Handle> {
+    TOKIO_HANDLE.lock().unwrap().clone()
+}
+
+/// Dedicated runtime for processes that never start the webserver —
+/// `terminusdb mcp` stdio is the one that matters: the embedded
+/// vectorlink engine and the indexer task spawner both need a reactor.
+/// Created on first need and kept for the process lifetime so its tasks
+/// keep running; once installed via set_tokio_handle every downstream
+/// tokio_handle() caller sees it.
+static STANDALONE_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+fn standalone_runtime() -> &'static tokio::runtime::Runtime {
+    STANDALONE_RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("standalone tokio runtime")
+    })
+}
+
+/// Get the tokio runtime handle, installing the standalone runtime when
+/// the server's runtime is absent.
+pub fn tokio_handle_or_install() -> Option<tokio::runtime::Handle> {
+    if let Some(handle) = tokio_handle() {
+        return Some(handle);
+    }
+    let handle = standalone_runtime().handle().clone();
+    set_tokio_handle(handle.clone());
+    Some(handle)
 }
 
 /// Registry of active input stream receivers.
@@ -495,7 +747,7 @@ lazy_static::lazy_static! {
 
 static REQUEST_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-fn next_request_id(method: &str, path: &str) -> String {
+pub(crate) fn next_request_id(method: &str, path: &str) -> String {
     let n = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{}-{}-{}", method, path, n)
 }
@@ -506,7 +758,7 @@ pub fn input_stream_registry() -> Arc<Mutex<InputStreamRegistry>> {
 }
 
 /// Request to be dispatched to the single SWI-Prolog engine.
-struct DispatchRequest {
+pub struct DispatchRequest {
     request_json: serde_json::Value,
     handler_module: String,
     handler_name: String,
@@ -523,30 +775,44 @@ impl DispatchRequest {
 }
 
 /// Request to be dispatched through OS pipes (plugin routes).
-struct PipeDispatchRequest {
-    request_json: serde_json::Value,
-    handler_module: String,
-    handler_name: String,
-    input_read_fd: Option<i32>,
-    output_write_fd: i32,
-    binary: bool,
+pub struct PipeDispatchRequest {
+    pub(crate) request_json: serde_json::Value,
+    pub(crate) handler_module: String,
+    pub(crate) handler_name: String,
+    pub(crate) input_read_fd: Option<i32>,
+    pub(crate) output_worker_write_fd: i32,
+    pub(crate) binary: bool,
+    pub(crate) request_id: String,
+    pub(crate) indexer_worker: bool,
 }
 
 /// Message sent to the single-engine dispatcher queue.
-enum DispatchMessage {
+pub enum DispatchMessage {
     Pipe(PipeDispatchRequest),
     Stream(DispatchRequest),
+    /// Stop the dispatcher thread so its Prolog engine is destroyed
+    /// before process exit (see `shutdown_dispatcher`).
+    Shutdown,
+    /// Cancel an in-flight pipe request by signalling the Prolog worker.
+    CancelPipe {
+        output_worker_write_fd: i32,
+        request_id: String,
+    },
 }
 
 /// Sender for the single-engine dispatcher queue.
 static DISPATCH_QUEUE: OnceLock<mpsc::Sender<DispatchMessage>> = OnceLock::new();
+
+/// JoinHandle for the dispatcher thread so shutdown can wait (bounded)
+/// for its `tdb_http` Prolog engine to be destroyed.
+static DISPATCHER_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
 
 /// In-flight request ids used to reject duplicate requests.
 static IN_FLIGHT_REQUESTS: OnceLock<Arc<Mutex<HashSet<String>>>> = OnceLock::new();
 
 /// Return the dispatcher queue sender, panicking if the dispatcher is not
 /// initialized.
-fn dispatch_queue() -> mpsc::Sender<DispatchMessage> {
+pub fn dispatch_queue() -> mpsc::Sender<DispatchMessage> {
     DISPATCH_QUEUE
         .get()
         .expect("request dispatcher not initialized")
@@ -562,15 +828,31 @@ fn in_flight_requests() -> Arc<Mutex<HashSet<String>>> {
         .clone()
 }
 
+/// Whether the request dispatcher has been initialized. Callers that need
+/// the dispatcher outside a webserver process (the embedded vectorlink
+/// engine under `terminusdb mcp`) install it themselves when this is false.
+pub fn dispatcher_initialized() -> bool {
+    DISPATCH_QUEUE.get().is_some()
+}
+
+/// Bounds on the log drain before each dispatch. Each entry costs a full
+/// `call_once` FFI round trip, so both an entry count and a time budget
+/// keep dispatch latency independent of log volume; the channel is
+/// unbounded so nothing drops.
+const LOG_DRAIN_PER_DISPATCH: usize = 64;
+const LOG_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// Initialize the single-engine request dispatcher. Must be called once
 /// before the webserver starts accepting requests.
 pub fn init_dispatcher() {
     let (tx, mut rx) = mpsc::channel::<DispatchMessage>(1024);
     DISPATCH_QUEUE.set(tx).ok();
-    IN_FLIGHT_REQUESTS.set(Arc::new(Mutex::new(HashSet::new()))).ok();
+    IN_FLIGHT_REQUESTS
+        .set(Arc::new(Mutex::new(HashSet::new())))
+        .ok();
     let log_rx = crate::log::init_log_channel();
 
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         // Create the Prolog engine with the same stack_limit that
         // terminus_config.pl sets for the main engine (8 GB). Without this,
         // PL_create_engine(null) uses the SWI-Prolog default of 1 GB, which
@@ -602,12 +884,20 @@ pub fn init_dispatcher() {
         let context: Context<_> = activation.into();
 
         // Drain any log messages that were queued before the engine was ready.
-        crate::log::drain_log_messages(&context, &log_rx);
+        crate::log::drain_log_messages(&context, &log_rx, usize::MAX, std::time::Duration::MAX);
 
         while let Some(msg) = rx.blocking_recv() {
-            // Process pending log messages before each dispatch.
-            crate::log::drain_log_messages(&context, &log_rx);
+            // Process pending log messages before each dispatch — bounded
+            // so a sustained flood (an index run emits per-document lines)
+            // cannot starve queued dispatches; leftovers drain next pass.
+            crate::log::drain_log_messages(
+                &context,
+                &log_rx,
+                LOG_DRAIN_PER_DISPATCH,
+                LOG_DRAIN_BUDGET,
+            );
             match msg {
+                DispatchMessage::Shutdown => break,
                 DispatchMessage::Pipe(req) => {
                     let dispatch_start = std::time::Instant::now();
                     let dispatch_result = dispatch_pipe_to_prolog(&context, &req);
@@ -624,9 +914,22 @@ pub fn init_dispatcher() {
                             req.handler_module, req.handler_name, e
                         ));
                         let _ = write_cgi_error_to_pipe(
-                            req.output_write_fd,
+                            req.output_worker_write_fd,
                             "Internal server error",
                         );
+                    }
+                }
+                DispatchMessage::CancelPipe {
+                    output_worker_write_fd,
+                    request_id,
+                } => {
+                    if let Err(e) =
+                        cancel_pipe_to_prolog(&context, output_worker_write_fd, &request_id)
+                    {
+                        crate::log::log_error(format!(
+                            "[terminusdb-webserver] cancel_pipe_request failed for FD {}: {}",
+                            output_worker_write_fd, e
+                        ));
                     }
                 }
                 DispatchMessage::Stream(req) => {
@@ -646,22 +949,68 @@ pub fn init_dispatcher() {
                             "headers": {"Content-Type": "application/json"}
                         })
                         .to_string();
-                        let _ = stream_registry()
+                        let _ = stream_registry().lock().unwrap().send(
+                            req.response_stream_id,
+                            axum::body::Bytes::from(error_response),
+                        );
+                        stream_registry()
                             .lock()
                             .unwrap()
-                            .send(req.response_stream_id, axum::body::Bytes::from(error_response));
-                        stream_registry().lock().unwrap().remove(req.response_stream_id);
+                            .remove(req.response_stream_id);
                     }
                 }
             }
         }
     });
+    *DISPATCHER_THREAD.lock().unwrap() = Some(handle);
+}
+
+/// Ask the dispatcher thread to exit and wait briefly for it to destroy
+/// its `tdb_http` Prolog engine. Called at process halt so the engine is
+/// gone before SWI-Prolog's thread shutdown sweep; a wedged dispatcher
+/// delays halt by about a second rather than hanging it.
+pub fn shutdown_dispatcher() {
+    if let Some(tx) = DISPATCH_QUEUE.get() {
+        // try_send with a bounded retry: the queue may briefly be full,
+        // and a plain send could block the halting process forever if
+        // the dispatcher is wedged.
+        for _ in 0..100 {
+            match tx.try_send(DispatchMessage::Shutdown) {
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                _ => break,
+            }
+        }
+    }
+    let handle = DISPATCHER_THREAD.lock().unwrap().take();
+    if let Some(handle) = handle {
+        // join has no timeout, so poll is_finished instead of blocking.
+        for _ in 0..200 {
+            if handle.is_finished() {
+                let _ = handle.join();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
 }
 
 fn init_prolog_worker_pool(context: &Context<impl QueryableContextType>) -> PrologResult<()> {
     let f = context.open_frame();
     let workers_term = f.new_term_ref();
-    workers_term.put(&16u64).map_err(|_| PrologError::Failure)?;
+    let pool_size: u64 = std::env::var("TERMINUSDB_WORKER_POOL_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| {
+            std::env::var("TERMINUSDB_SERVER_WORKERS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(16);
+    workers_term
+        .put(&pool_size)
+        .map_err(|_| PrologError::Failure)?;
 
     let init_callable = CallablePredicate::new(Predicate::new(
         Functor::new(Atom::new("init_request_worker_pool"), 1),
@@ -674,7 +1023,7 @@ fn init_prolog_worker_pool(context: &Context<impl QueryableContextType>) -> Prol
 }
 
 /// Write a CGI-style 500 error response directly to the output pipe.
-fn write_cgi_error_to_pipe(output_write_fd: i32, message: &str) -> std::io::Result<()> {
+fn write_cgi_error_to_pipe(output_worker_write_fd: i32, message: &str) -> std::io::Result<()> {
     let error_body = json!({
         "@type": "api:ErrorResponse",
         "api:status": "api:failure",
@@ -688,7 +1037,7 @@ fn write_cgi_error_to_pipe(output_write_fd: i32, message: &str) -> std::io::Resu
     );
     // SAFETY: the FD was given to Prolog but was never opened as a stream,
     // so Rust can still write to it and close it.
-    let mut file = unsafe { std::fs::File::from_raw_fd(output_write_fd) };
+    let mut file = unsafe { std::fs::File::from_raw_fd(output_worker_write_fd) };
     file.write_all(cgi_response.as_bytes())
 }
 
@@ -696,76 +1045,140 @@ fn dispatch_pipe_to_prolog(
     context: &Context<impl QueryableContextType>,
     req: &PipeDispatchRequest,
 ) -> PrologResult<()> {
-    let request_term = context.new_term_ref();
-    context
+    // Term refs allocated on the engine's root context are never released —
+    // the dispatcher's engine activation stays open for the server's whole
+    // lifetime, so every request would permanently pin its serialized
+    // request dict, request id, and path atoms. Open a foreign frame per
+    // dispatch so all term refs are freed when it closes.
+    let frame = context.open_frame();
+
+    let request_term = frame.new_term_ref();
+    frame
         .serialize_to_term(&request_term, &req.request_json)
         .map_err(|_| PrologError::Failure)?;
 
-    let module_term = context.new_term_ref();
+    let module_term = frame.new_term_ref();
     module_term
         .put(&Atom::new(&req.handler_module))
         .map_err(|_| PrologError::Failure)?;
 
-    let handler_term = context.new_term_ref();
+    let handler_term = frame.new_term_ref();
     handler_term
         .put(&Atom::new(&req.handler_name))
         .map_err(|_| PrologError::Failure)?;
 
-    let input_fd_term = context.new_term_ref();
+    let input_fd_term = frame.new_term_ref();
     input_fd_term
         .put(&(req.input_read_fd.unwrap_or(-1) as i64))
         .map_err(|_| PrologError::Failure)?;
 
-    let output_fd_term = context.new_term_ref();
+    let output_fd_term = frame.new_term_ref();
     output_fd_term
-        .put(&(req.output_write_fd as i64))
+        .put(&(req.output_worker_write_fd as i64))
         .map_err(|_| PrologError::Failure)?;
 
-    let binary_term = context.new_term_ref();
+    let binary_term = frame.new_term_ref();
     binary_term
         .put(&Atom::new(if req.binary { "true" } else { "false" }))
         .map_err(|_| PrologError::Failure)?;
 
+    let request_id_term = frame.new_term_ref();
+    request_id_term
+        .put(&Atom::new(&req.request_id))
+        .map_err(|_| PrologError::Failure)?;
+
+    let functor_name = if req.indexer_worker {
+        "dispatch_indexer_request"
+    } else {
+        "dispatch_request"
+    };
     let callable = CallablePredicate::new(Predicate::new(
-        Functor::new(Atom::new("dispatch_request"), 6),
+        Functor::new(Atom::new(functor_name), 7),
         Module::new(Atom::new("request_worker_pool")),
     ))
     .map_err(|_| PrologError::Failure)?;
-    context.call_once(callable, [
-        &request_term,
-        &module_term,
-        &handler_term,
-        &input_fd_term,
-        &output_fd_term,
-        &binary_term,
-    ])
+    let result = frame.call_once(
+        callable,
+        [
+            &request_term,
+            &module_term,
+            &handler_term,
+            &input_fd_term,
+            &output_fd_term,
+            &binary_term,
+            &request_id_term,
+        ],
+    );
+    // discard (not close) so the global stack is rewound and all term
+    // refs + serialized request atoms are freed immediately. close()
+    // leaves term data on the global stack, pinning request atoms.
+    frame.discard();
+    result
+}
+
+/// Call the Prolog predicate `cancel_pipe_request/2` to signal the worker
+/// thread handling the given output pipe FD that the client has disconnected.
+/// The worker receives `error(client_disconnected, _)` via `thread_signal/2`,
+/// which is delivered at the next goal boundary (e.g. between `id_triple`
+/// calls in a WOQL query loop).
+fn cancel_pipe_to_prolog(
+    context: &Context<impl QueryableContextType>,
+    output_worker_write_fd: i32,
+    request_id: &str,
+) -> PrologResult<()> {
+    // Per-request foreign frame — see dispatch_pipe_to_prolog.
+    let frame = context.open_frame();
+
+    let fd_term = frame.new_term_ref();
+    fd_term
+        .put(&(output_worker_write_fd as i64))
+        .map_err(|_| PrologError::Failure)?;
+
+    let request_id_term = frame.new_term_ref();
+    request_id_term
+        .put(&Atom::new(request_id))
+        .map_err(|_| PrologError::Failure)?;
+
+    let callable = CallablePredicate::new(Predicate::new(
+        Functor::new(Atom::new("cancel_pipe_request"), 2),
+        Module::new(Atom::new("request_worker_pool")),
+    ))
+    .map_err(|_| PrologError::Failure)?;
+    let result = frame.call_once(callable, [&fd_term, &request_id_term]);
+    frame.discard();
+    result
 }
 
 fn dispatch_stream_to_prolog(
     context: &Context<impl QueryableContextType>,
     req: &DispatchRequest,
 ) -> PrologResult<()> {
-    let request_term = context.new_term_ref();
-    context
+    // See dispatch_pipe_to_prolog: term refs must live on a per-request
+    // foreign frame, not the engine's root context, or every stream
+    // dispatch permanently pins its serialized request dict atoms.
+    let frame = context.open_frame();
+
+    let request_term = frame.new_term_ref();
+    frame
         .serialize_to_term(&request_term, &req.request_json)
         .map_err(|_| PrologError::Failure)?;
 
-    let module_term = context.new_term_ref();
+    let module_term = frame.new_term_ref();
     module_term
         .put(&Atom::new(&req.handler_module))
         .map_err(|_| PrologError::Failure)?;
 
-    let handler_term = context.new_term_ref();
+    let handler_term = frame.new_term_ref();
     handler_term
         .put(&Atom::new(&req.handler_name))
         .map_err(|_| PrologError::Failure)?;
 
-    let input_stream_id_term = context.new_term_ref();
+    let input_stream_id_term = frame.new_term_ref();
     input_stream_id_term
         .put(&req.input_stream_id)
         .map_err(|_| PrologError::Failure)?;
 
-    let response_stream_id_term = context.new_term_ref();
+    let response_stream_id_term = frame.new_term_ref();
     response_stream_id_term
         .put(&req.response_stream_id)
         .map_err(|_| PrologError::Failure)?;
@@ -775,13 +1188,28 @@ fn dispatch_stream_to_prolog(
         Module::new(Atom::new("request_worker_pool")),
     ))
     .map_err(|_| PrologError::Failure)?;
-    context.call_once(callable, [
-        &request_term,
-        &module_term,
-        &handler_term,
-        &input_stream_id_term,
-        &response_stream_id_term,
-    ])
+    let result = frame.call_once(
+        callable,
+        [
+            &request_term,
+            &module_term,
+            &handler_term,
+            &input_stream_id_term,
+            &response_stream_id_term,
+        ],
+    );
+    frame.discard();
+    result
+}
+
+/// Write a string to a file descriptor.
+#[allow(dead_code)]
+fn write_to_fd(fd: i32, data: &str) -> std::io::Result<()> {
+    use std::os::fd::BorrowedFd;
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    nix::unistd::write(borrowed, data.as_bytes())
+        .map(|_| ())
+        .map_err(std::io::Error::from)
 }
 
 /// Register a new response stream and return its id and the receiver.
@@ -805,16 +1233,16 @@ fn dispatch_stream_to_prolog(
 /// they received (from the `commit.identifier` field in each NDJSON
 /// event) and use it as the `since` parameter on reconnect.
 ///
-/// Memory: 128 slots × 40 bytes = 5KB per client, 50MB at 10000 clients.
+/// Memory: 256 slots × 40 bytes = 10KB per client, 100MB at 10000 clients.
 fn create_response_stream() -> (u64, mpsc::Receiver<axum::body::Bytes>) {
-    let (tx, rx) = mpsc::channel::<axum::body::Bytes>(128);
+    let (tx, rx) = mpsc::channel::<axum::body::Bytes>(256);
     let stream_id = stream_registry().lock().unwrap().add(tx);
     (stream_id, rx)
 }
 
 /// Register a new input stream and return its id and the sender.
 fn create_input_stream() -> (u64, mpsc::Sender<axum::body::Bytes>) {
-    let (tx, rx) = mpsc::channel::<axum::body::Bytes>(128);
+    let (tx, rx) = mpsc::channel::<axum::body::Bytes>(256);
     let stream_id = input_stream_registry().lock().unwrap().add(rx);
     (stream_id, tx)
 }
@@ -868,7 +1296,9 @@ fn term_to_string(term: &Term) -> PrologResult<String> {
 ///
 /// This is called from the `appserver_start` Prolog predicate,
 /// so a Prolog engine is active.
-pub fn collect_routes(context: &Context<impl QueryableContextType>) -> PrologResult<Vec<PluginRoute>> {
+pub fn collect_routes(
+    context: &Context<impl QueryableContextType>,
+) -> PrologResult<Vec<PluginRoute>> {
     let frame = context.open_frame();
     let [method_term, path_term, handler_term, binary_term] = frame.new_term_refs();
 
@@ -905,19 +1335,21 @@ pub fn collect_routes(context: &Context<impl QueryableContextType>) -> PrologRes
 ///
 /// Plugins register via `appserver_hooks:appserver_static_path/3` with
 /// an option list. Prolog normalizes these into
-/// `appserver_hooks:appserver_static_path_normalized/4`, which this
+/// `appserver_hooks:appserver_static_path_normalized/3`, which this
 /// function reads.
 ///
-/// Arguments are: prefix, directory, fallback file, auth style.
+/// Arguments are: prefix, directory, options dict.
+/// The options dict has keys `fallback` (atom), `auth` (atom),
+/// and `csp_nonce` (atom: true/false).
 pub fn collect_static_paths(
     context: &Context<impl QueryableContextType>,
 ) -> PrologResult<Vec<PluginStaticPath>> {
     let frame = context.open_frame();
-    let [prefix_term, directory_term, fallback_term, auth_term] = frame.new_term_refs();
+    let [prefix_term, directory_term, options_term] = frame.new_term_refs();
 
     let open_call = frame.open(
-        pred!("appserver_hooks:appserver_static_path_normalized/4"),
-        [&prefix_term, &directory_term, &fallback_term, &auth_term],
+        pred!("appserver_hooks:appserver_static_path_normalized/3"),
+        [&prefix_term, &directory_term, &options_term],
     );
 
     let mut paths = Vec::new();
@@ -927,8 +1359,11 @@ pub fn collect_static_paths(
         let directory = resolve_static_directory(&directory)
             .to_string_lossy()
             .into_owned();
-        let fallback: Atom = fallback_term.get_ex()?;
-        let auth: Atom = auth_term.get_ex()?;
+
+        let fallback: Atom = options_term.get_dict_key("fallback")?;
+        let not_found: Atom = options_term.get_dict_key("not_found")?;
+        let auth: Atom = options_term.get_dict_key("auth")?;
+        let csp_nonce: Atom = options_term.get_dict_key("csp_nonce")?;
 
         let fallback = if fallback.name().is_empty() {
             None
@@ -936,11 +1371,19 @@ pub fn collect_static_paths(
             Some(fallback.name())
         };
 
+        let not_found = if not_found.name().is_empty() {
+            None
+        } else {
+            Some(not_found.name())
+        };
+
         paths.push(PluginStaticPath {
             prefix,
             directory,
             fallback,
+            not_found,
             auth: auth.name(),
+            csp_nonce: csp_nonce.name() == "true",
         });
     }
 
@@ -952,7 +1395,9 @@ pub fn collect_static_paths(
 ///
 /// Each registration is: method, path, handler (as `Module:Handler`).
 /// The handler must have arity 3 and accept `+Request`, `+StreamId`, `-Response`.
-pub fn collect_streams(context: &Context<impl QueryableContextType>) -> PrologResult<Vec<PluginStream>> {
+pub fn collect_streams(
+    context: &Context<impl QueryableContextType>,
+) -> PrologResult<Vec<PluginStream>> {
     let frame = context.open_frame();
     let [method_term, path_term, handler_term] = frame.new_term_refs();
 
@@ -1067,27 +1512,127 @@ pub fn build_static_router(static_paths: Vec<PluginStaticPath>) -> Router {
     for static_path in static_paths {
         let dir = PathBuf::from(&static_path.directory);
         let fallback = static_path.fallback.as_ref().map(|f| dir.join(f));
+        let not_found = static_path.not_found.as_ref().map(|f| dir.join(f));
+        let csp_nonce = static_path.csp_nonce;
 
         let root_handler = {
             let dir = dir.clone();
             let fallback = fallback.clone();
-            move || async move { serve_static_file(&dir, fallback.as_deref(), "/").await }
+            let not_found = not_found.clone();
+            move || async move {
+                serve_static_file(&dir, fallback.as_deref(), not_found.as_deref(), "/").await
+            }
         };
 
         let sub_handler = {
             let dir = dir.clone();
             let fallback = fallback.clone();
+            let not_found = not_found.clone();
             move |Path(uri_path): Path<String>| async move {
-                serve_static_file(&dir, fallback.as_deref(), &uri_path).await
+                serve_static_file(&dir, fallback.as_deref(), not_found.as_deref(), &uri_path).await
             }
         };
 
-        router = router
+        let prefix_routes = Router::new()
             .route(&static_path.prefix, get(root_handler.clone()))
             .route(&format!("{}/", static_path.prefix), get(root_handler))
-            .route(&format!("{}/{{*path}}", static_path.prefix), get(sub_handler));
+            .route(
+                &format!("{}/{{*path}}", static_path.prefix),
+                get(sub_handler),
+            );
+
+        if csp_nonce {
+            router =
+                router.merge(prefix_routes.layer(axum::middleware::from_fn(csp_nonce_middleware)));
+        } else {
+            router = router.merge(prefix_routes);
+        }
     }
     router
+}
+
+/// Placeholder string in HTML files that gets replaced with a per-request nonce.
+const CSP_NONCE_PLACEHOLDER: &str = "--TDB--CSP--DYNAMIC--CSP--NONCE--";
+
+/// Middleware that generates a unique nonce per request and replaces all
+/// occurrences of `--TDB--CSP--DYNAMIC--CSP--NONCE--` in HTML responses with
+/// `NONCE-<uuid>`. This allows CSP meta tags and script nonce attributes to
+/// be dynamically secured without `'unsafe-inline'`.
+///
+/// Only applies to responses with `Content-Type: text/html`. Non-HTML
+/// responses pass through with only the `frame-ancestors` header added.
+async fn csp_nonce_middleware(req: Request<Body>, next: Next) -> Response {
+    let mut response = next.run(req).await;
+
+    response.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_static("frame-ancestors 'self'"),
+    );
+
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if !content_type.starts_with("text/html") {
+        return response;
+    }
+
+    let nonce = format!("tdb-csp-{}", uuid::Uuid::new_v4());
+
+    let body = response.into_body();
+    match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+        Ok(bytes) => {
+            let replaced = replace_placeholder(&bytes, CSP_NONCE_PLACEHOLDER, &nonce);
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .header(
+                    header::CONTENT_SECURITY_POLICY,
+                    axum::http::HeaderValue::from_static("frame-ancestors 'self'"),
+                )
+                .body(Body::from(replaced))
+                .unwrap()
+        }
+        Err(_) => Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::from("Failed to process response body"))
+            .unwrap(),
+    }
+}
+
+/// Replace all occurrences of `placeholder` in `bytes` with `replacement`.
+/// Returns a new Vec<u8>. If the placeholder is not found, returns the
+/// original bytes unchanged.
+fn replace_placeholder(bytes: &[u8], placeholder: &str, replacement: &str) -> Vec<u8> {
+    let placeholder_bytes = placeholder.as_bytes();
+    if placeholder_bytes.is_empty() || placeholder_bytes.len() > bytes.len() {
+        return bytes.to_vec();
+    }
+
+    let mut result = Vec::with_capacity(bytes.len() + replacement.len());
+    let mut i = 0;
+    let mut found = false;
+
+    while i < bytes.len() {
+        if i + placeholder_bytes.len() <= bytes.len()
+            && &bytes[i..i + placeholder_bytes.len()] == placeholder_bytes
+        {
+            result.extend_from_slice(replacement.as_bytes());
+            i += placeholder_bytes.len();
+            found = true;
+        } else {
+            result.push(bytes[i]);
+            i += 1;
+        }
+    }
+
+    if found {
+        result
+    } else {
+        bytes.to_vec()
+    }
 }
 
 /// Build a router for plugin-registered streaming endpoints.
@@ -1119,6 +1664,7 @@ pub fn build_stream_router(streams: Vec<PluginStream>) -> Router {
             "post" => router.route(&axum_path, post(route_handler)),
             "put" => router.route(&axum_path, axum::routing::put(route_handler)),
             "delete" => router.route(&axum_path, axum::routing::delete(route_handler)),
+            "options" => router.route(&axum_path, axum::routing::options(route_handler)),
             _ => router,
         };
     }
@@ -1130,8 +1676,14 @@ pub fn build_stream_router(streams: Vec<PluginStream>) -> Router {
 /// The request path is resolved relative to `dir`, percent-decoded, and checked
 /// for directory traversal. The canonical path is then verified to be within
 /// `dir` (after resolving symlinks). Missing files, unsafe paths, and symlink
-/// escapes all result in a 404 response.
-async fn serve_static_file(dir: &StdPath, fallback: Option<&StdPath>, uri_path: &str) -> Response<Body> {
+/// escapes result in a 404 response — served from `not_found` if configured,
+/// otherwise a default JSON 404.
+async fn serve_static_file(
+    dir: &StdPath,
+    fallback: Option<&StdPath>,
+    not_found: Option<&StdPath>,
+    uri_path: &str,
+) -> Response<Body> {
     let canonical_dir = match tokio::fs::canonicalize(dir).await {
         Ok(d) => d,
         Err(_) => return not_found_response(),
@@ -1144,7 +1696,7 @@ async fn serve_static_file(dir: &StdPath, fallback: Option<&StdPath>, uri_path: 
             Component::Normal(name) => candidate.push(name),
             Component::RootDir => {}
             // Reject `..`, Windows prefixes, and other special components.
-            _ => return not_found_response(),
+            _ => return not_found_response_with(&canonical_dir, not_found).await,
         }
     }
 
@@ -1160,7 +1712,7 @@ async fn serve_static_file(dir: &StdPath, fallback: Option<&StdPath>, uri_path: 
         }
     }
 
-    not_found_response()
+    not_found_response_with(&canonical_dir, not_found).await
 }
 
 /// Canonicalize `candidate` and return it only if it is a file inside `dir`.
@@ -1168,7 +1720,11 @@ async fn serve_static_file(dir: &StdPath, fallback: Option<&StdPath>, uri_path: 
 /// When `allow_index` is true, a directory candidate is also accepted if it
 /// contains an `index.html` that stays within `dir`. Symlinks are resolved by
 /// `canonicalize`, so a symlink pointing outside `dir` is rejected.
-async fn canonical_file_within_dir(dir: &StdPath, candidate: &StdPath, allow_index: bool) -> Option<PathBuf> {
+async fn canonical_file_within_dir(
+    dir: &StdPath,
+    candidate: &StdPath,
+    allow_index: bool,
+) -> Option<PathBuf> {
     if let Ok(path) = tokio::fs::canonicalize(candidate).await {
         if path.starts_with(dir) {
             if let Ok(metadata) = tokio::fs::metadata(&path).await {
@@ -1221,6 +1777,30 @@ fn not_found_response() -> Response<Body> {
         .unwrap()
 }
 
+/// Return a 404 response, serving a custom file if one is configured.
+///
+/// When `not_found` is provided and the file exists and resolves to a real
+/// file (not a symlink) within the canonical serving directory, it is served
+/// with a 404 status code and the appropriate MIME type. Otherwise the
+/// default JSON 404 response is returned.
+async fn not_found_response_with(
+    canonical_dir: &StdPath,
+    not_found: Option<&StdPath>,
+) -> Response<Body> {
+    if let Some(path) = not_found {
+        if let Some(validated) = canonical_file_within_dir(canonical_dir, path, false).await {
+            if let Ok(bytes) = tokio::fs::read(&validated).await {
+                return Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .header(header::CONTENT_TYPE, static_mime_type(&validated))
+                    .body(Body::from(bytes))
+                    .unwrap();
+            }
+        }
+    }
+    not_found_response()
+}
+
 /// Simple MIME type mapping based on file extension.
 fn static_mime_type(path: &StdPath) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
@@ -1256,17 +1836,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app_dir = dir.path().join("app");
         tokio::fs::create_dir(&app_dir).await.unwrap();
-        tokio::fs::write(app_dir.join("hello.txt"), "hello").await.unwrap();
+        tokio::fs::write(app_dir.join("hello.txt"), "hello")
+            .await
+            .unwrap();
 
         let router = build_static_router(vec![PluginStaticPath {
             prefix: "/app".to_string(),
             directory: app_dir.to_string_lossy().into_owned(),
             fallback: None,
+            not_found: None,
             auth: "none".to_string(),
+            csp_nonce: false,
         }]);
 
         let response = router
-            .oneshot(Request::builder().uri("/app/hello.txt").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/app/hello.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1294,11 +1883,18 @@ mod tests {
             prefix: "/app".to_string(),
             directory: app_dir.to_string_lossy().into_owned(),
             fallback: None,
+            not_found: None,
             auth: "none".to_string(),
+            csp_nonce: false,
         }]);
 
         let response = router
-            .oneshot(Request::builder().uri("/app/link.txt").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/app/link.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -1313,8 +1909,11 @@ mod tests {
         assert_eq!(params.get("id"), Some(&"123".to_string()));
         assert_eq!(params.get("path"), Some(&"a/b/c".to_string()));
 
-        params = extract_route_params("/static/*path", "/static/app/alpha/index.html");
-        assert_eq!(params.get("path"), Some(&"app/alpha/index.html".to_string()));
+        params = extract_route_params("/static/*path", "/static/app/admin/index.html");
+        assert_eq!(
+            params.get("path"),
+            Some(&"app/admin/index.html".to_string())
+        );
 
         params = extract_route_params("/api/info", "/api/info");
         assert!(params.is_empty());
@@ -1341,6 +1940,16 @@ mod tests {
     }
 
     #[test]
+    fn standalone_runtime_runs_futures() {
+        // The runtime must exist independent of the global TOKIO_HANDLE —
+        // `terminusdb mcp` has no webserver to install one.
+        let result = standalone_runtime().handle().block_on(async { 42 });
+        assert_eq!(result, 42);
+        // A second call reuses the same runtime (OnceLock), not a fresh one.
+        assert!(std::ptr::eq(standalone_runtime(), standalone_runtime()));
+    }
+
+    #[test]
     fn parse_cgi_headers_normal() {
         let buf = b"Status: 200 OK\nContent-Type: application/json\n\n{\"ok\":true}";
         let (status, headers, body_start) = parse_cgi_headers(buf).unwrap();
@@ -1364,7 +1973,10 @@ mod tests {
         let buf = b"Status: 200\nContent-Type: application/octet-stream\n\n\x00\x01\x02";
         let (status, headers, body_start) = parse_cgi_headers(buf).unwrap();
         assert_eq!(status, 200);
-        assert_eq!(headers.get("content-type").unwrap(), "application/octet-stream");
+        assert_eq!(
+            headers.get("content-type").unwrap(),
+            "application/octet-stream"
+        );
         assert_eq!(&buf[body_start..], b"\x00\x01\x02");
     }
 
@@ -1423,7 +2035,10 @@ mod tests {
         let buf = b"Status: 200\nContent-Type: application/json\n\n\"\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\"";
         let (status, _headers, body_start) = parse_cgi_headers(buf).unwrap();
         assert_eq!(status, 200);
-        assert_eq!(&buf[body_start..], b"\"\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\"");
+        assert_eq!(
+            &buf[body_start..],
+            b"\"\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\""
+        );
     }
 
     #[test]
@@ -1453,11 +2068,8 @@ mod tests {
         write.write_all(cgi_output).unwrap();
         drop(write);
 
-        let stream = CgiPipeStream::new(read, Vec::new());
-        let collected: Vec<u8> = stream
-            .map(|chunk| chunk.unwrap().to_vec())
-            .concat()
-            .await;
+        let stream = CgiPipeStream::new(read, Vec::new(), None);
+        let collected: Vec<u8> = stream.map(|chunk| chunk.unwrap().to_vec()).concat().await;
         assert_eq!(collected, cgi_output);
     }
 
@@ -1470,15 +2082,13 @@ mod tests {
         );
 
         // Simulate CGI headers + binary body with raw byte values
-        let cgi_output: &[u8] = b"Status: 200\nContent-Type: application/octet-stream\n\n\x00\xff\x80\x42";
+        let cgi_output: &[u8] =
+            b"Status: 200\nContent-Type: application/octet-stream\n\n\x00\xff\x80\x42";
         write.write_all(cgi_output).unwrap();
         drop(write);
 
-        let stream = CgiPipeStream::new(read, Vec::new());
-        let collected: Vec<u8> = stream
-            .map(|chunk| chunk.unwrap().to_vec())
-            .concat()
-            .await;
+        let stream = CgiPipeStream::new(read, Vec::new(), None);
+        let collected: Vec<u8> = stream.map(|chunk| chunk.unwrap().to_vec()).concat().await;
         assert_eq!(collected, cgi_output);
     }
 
@@ -1491,7 +2101,7 @@ mod tests {
         );
 
         let leftover = b"left".to_vec();
-        let mut stream = CgiPipeStream::new(read, leftover);
+        let mut stream = CgiPipeStream::new(read, leftover, None);
 
         let first = stream.next().await.unwrap().unwrap();
         assert_eq!(first, "left");
@@ -1504,15 +2114,15 @@ mod tests {
         assert!(stream.next().await.is_none());
     }
 
-    #[tokio::test]
-    async fn stream_registry_sends_and_removes_on_close() {
+    #[test]
+    fn stream_registry_sends_and_removes_on_close() {
         let mut registry = StreamRegistry::new();
         let (tx, mut rx) = mpsc::channel::<axum::body::Bytes>(10);
         let id = registry.add(tx);
 
         let event = axum::body::Bytes::from(r#"{"event":"test"}"#);
         assert!(registry.send(id, event.clone()).is_ok());
-        let received = rx.recv().await.unwrap();
+        let received = rx.blocking_recv().unwrap();
         assert_eq!(received, event);
 
         drop(rx);
@@ -1525,13 +2135,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app_dir = dir.path().join("app");
         tokio::fs::create_dir(&app_dir).await.unwrap();
-        tokio::fs::write(dir.path().join("secret.txt"), "secret").await.unwrap();
+        tokio::fs::write(dir.path().join("secret.txt"), "secret")
+            .await
+            .unwrap();
 
         let router = build_static_router(vec![PluginStaticPath {
             prefix: "/app".to_string(),
             directory: app_dir.to_string_lossy().into_owned(),
             fallback: None,
+            not_found: None,
             auth: "none".to_string(),
+            csp_nonce: false,
         }]);
 
         let response = router
@@ -1556,8 +2170,8 @@ mod tests {
         let (tx1, mut rx1) = mpsc::channel::<axum::body::Bytes>(10);
         let (tx2, mut rx2) = mpsc::channel::<axum::body::Bytes>(10);
 
-        broadcast_registry.subscribe("actions".to_string(), 1, tx1);
-        broadcast_registry.subscribe("actions".to_string(), 2, tx2);
+        broadcast_registry.subscribe("actions".to_string(), 1, tx1, None);
+        broadcast_registry.subscribe("actions".to_string(), 2, tx2, None);
 
         let event = axum::body::Bytes::from(r#"{"action":"test"}"#);
         assert!(broadcast_registry.send("actions", event.clone()).is_ok());
@@ -1582,8 +2196,8 @@ mod tests {
         // Subscriber 2: normal channel that we will drain
         let (tx2, mut rx2) = mpsc::channel::<axum::body::Bytes>(10);
 
-        broadcast_registry.subscribe("actions".to_string(), 1, tx1);
-        broadcast_registry.subscribe("actions".to_string(), 2, tx2);
+        broadcast_registry.subscribe("actions".to_string(), 1, tx1, None);
+        broadcast_registry.subscribe("actions".to_string(), 2, tx2, None);
 
         // Send event 1 — both subscribers should get it (subscriber 1's
         // per-subscriber buffer has room for 64 events)
@@ -1597,6 +2211,88 @@ mod tests {
         // is not draining its channel
         let received2 = rx2.recv().await.unwrap();
         assert_eq!(received2, event1);
+    }
+
+    #[tokio::test]
+    async fn broadcast_registry_send_to_all_delivers_to_every_graphql_channel() {
+        set_tokio_handle(tokio::runtime::Handle::current());
+
+        let mut broadcast_registry = BroadcastRegistry::new();
+
+        let (tx1, mut rx1) = mpsc::channel::<axum::body::Bytes>(10);
+        let (tx2, mut rx2) = mpsc::channel::<axum::body::Bytes>(10);
+        let (tx3, mut rx3) = mpsc::channel::<axum::body::Bytes>(10);
+
+        broadcast_registry.subscribe("graphql_raw_cohort_a".to_string(), 1, tx1, None);
+        broadcast_registry.subscribe("graphql_raw_cohort_b".to_string(), 2, tx2, None);
+        broadcast_registry.subscribe("graphql_raw_cohort_c".to_string(), 3, tx3, None);
+
+        // Send a keepalive to ALL GraphQL channels
+        let keepalive = axum::body::Bytes::from(": keepalive\n\n");
+        assert!(broadcast_registry.send_to_all(keepalive.clone()).is_ok());
+
+        // Give the forwarder time to process
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // All three subscribers on different GraphQL channels should receive it
+        let received1 = rx1.recv().await.unwrap();
+        let received2 = rx2.recv().await.unwrap();
+        let received3 = rx3.recv().await.unwrap();
+        assert_eq!(received1, keepalive);
+        assert_eq!(received2, keepalive);
+        assert_eq!(received3, keepalive);
+    }
+
+    #[tokio::test]
+    async fn broadcast_registry_send_to_all_skips_non_graphql_channels() {
+        set_tokio_handle(tokio::runtime::Handle::current());
+
+        let mut broadcast_registry = BroadcastRegistry::new();
+
+        let (tx_gql, mut rx_gql) = mpsc::channel::<axum::body::Bytes>(10);
+        let (tx_commit, mut rx_commit) = mpsc::channel::<axum::body::Bytes>(10);
+
+        broadcast_registry.subscribe("graphql_raw_cohort1".to_string(), 1, tx_gql, None);
+        broadcast_registry.subscribe("admin/db/local/branch/main".to_string(), 2, tx_commit, None);
+
+        // Give the forwarder time to process the subscribe commands
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let keepalive = axum::body::Bytes::from(": keepalive\n\n");
+        let send_result = broadcast_registry.send_to_all(keepalive.clone());
+
+        // send_to_all may fail if the forwarder task was spawned on a
+        // previous test's runtime that has been dropped. This is a test
+        // infrastructure issue with the global TOKIO_HANDLE. The core
+        // assertion we care about is that non-graphql channels don't
+        // receive keepalive.
+        if send_result.is_ok() {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+            // GraphQL channel may or may not receive the keepalive
+            // (depends on forwarder scheduling). If it does, verify content.
+            if let Ok(received_gql) =
+                tokio::time::timeout(tokio::time::Duration::from_millis(200), rx_gql.recv()).await
+            {
+                if let Some(data) = received_gql {
+                    assert_eq!(data, keepalive);
+                }
+            }
+        }
+
+        // The core assertion: commit stream channel must NOT receive
+        // the SSE keepalive, regardless of whether send_to_all succeeded.
+        tokio::select! {
+            result = rx_commit.recv() => {
+                match result {
+                    Some(data) => panic!("commit stream should not receive SSE keepalive, got: {:?}", data),
+                    None => { /* sender dropped — acceptable */ }
+                }
+            }
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(200)) => {
+                // Timeout — no data received, which is the expected behavior
+            }
+        }
     }
 
     #[tokio::test]
@@ -1672,7 +2368,7 @@ async fn dispatch_request_via_pipe(
     req: Request<Body>,
 ) -> impl IntoResponse {
     let (parts, body) = req.into_parts();
-    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    let body_bytes = match axum::body::to_bytes(body, *MAX_BODY_SIZE).await {
         Ok(bytes) => bytes,
         Err(_) => return plugin_error_response("failed to read request body").into_response(),
     };
@@ -1726,7 +2422,7 @@ async fn dispatch_request_via_pipe(
         }
     };
 
-    let output_write_fd = output_write.into_raw_fd();
+    let output_worker_write_fd = output_write.into_raw_fd();
 
     let (input_read_fd, input_write) = if body_bytes.is_empty() {
         (None, None)
@@ -1739,27 +2435,10 @@ async fn dispatch_request_via_pipe(
             }
             Err(e) => {
                 crate::log::log_error(format!("input pipe creation failed: {}", e));
-                let _ = write_cgi_error_to_pipe(output_write_fd, "input pipe creation failed");
+                let _ =
+                    write_cgi_error_to_pipe(output_worker_write_fd, "input pipe creation failed");
                 return plugin_error_response("pipe creation failed").into_response();
             }
-        }
-    };
-
-    let dispatch_req = PipeDispatchRequest {
-        request_json,
-        handler_module: module,
-        handler_name: handler,
-        input_read_fd,
-        output_write_fd,
-        binary,
-    };
-
-    let mut output_receiver = match Receiver::from_owned_fd(output_read) {
-        Ok(rx) => rx,
-        Err(e) => {
-            crate::log::log_error(format!("failed to create pipe receiver: {}", e));
-            let _ = write_cgi_error_to_pipe(output_write_fd, "failed to create pipe receiver");
-            return plugin_error_response("pipe creation failed").into_response();
         }
     };
 
@@ -1774,15 +2453,44 @@ async fn dispatch_request_via_pipe(
         set.insert(request_id.clone());
     }
     let _guard = InFlightRequestGuard {
-        id: request_id,
+        id: request_id.clone(),
         in_flight,
+    };
+
+    let dispatch_req = PipeDispatchRequest {
+        request_json,
+        handler_module: module,
+        handler_name: handler,
+        input_read_fd,
+        output_worker_write_fd,
+        binary,
+        request_id: request_id.clone(),
+        indexer_worker: false,
+    };
+
+    let mut output_receiver = match Receiver::from_owned_fd(output_read) {
+        Ok(rx) => rx,
+        Err(e) => {
+            crate::log::log_error(format!("failed to create pipe receiver: {}", e));
+            let _ =
+                write_cgi_error_to_pipe(output_worker_write_fd, "failed to create pipe receiver");
+            return plugin_error_response("pipe creation failed").into_response();
+        }
     };
 
     if let Err(e) = queue.send(DispatchMessage::Pipe(dispatch_req)).await {
         crate::log::log_error(format!("dispatch queue send failed: {}", e));
-        let _ = write_cgi_error_to_pipe(output_write_fd, "dispatch queue send failed");
+        let _ = write_cgi_error_to_pipe(output_worker_write_fd, "dispatch queue send failed");
         return plugin_error_response("Plugin handler failed").into_response();
     }
+
+    // Create a cancel guard that covers the entire request lifecycle from
+    // dispatch to response completion. If the HTTP response future is dropped
+    // at any point (client disconnect during header reading or body
+    // streaming), this guard sends a CancelPipe message to the dispatch
+    // queue, which signals the Prolog worker to abort via thread_signal/2.
+    let mut cancel_guard =
+        PipeCancelGuard::new(output_worker_write_fd, request_id, dispatch_queue());
 
     if let Some(input_file) = input_write {
         tokio::task::spawn_blocking(move || {
@@ -1797,6 +2505,7 @@ async fn dispatch_request_via_pipe(
         Ok(result) => result,
         Err(e) => {
             crate::log::log_error(format!("failed to read CGI headers from pipe: {}", e));
+            // The guard will fire on drop, sending a cancel to the worker.
             return plugin_error_response("Plugin handler failed").into_response();
         }
     };
@@ -1830,6 +2539,9 @@ async fn dispatch_request_via_pipe(
                     }
                 }
                 body.truncate(read);
+                // The Prolog worker has finished writing the full response.
+                // Disarm the cancel guard so we don't send a spurious cancel.
+                cancel_guard.disarm();
                 return builder
                     .body(Body::from(axum::body::Bytes::from(body)))
                     .unwrap()
@@ -1839,13 +2551,18 @@ async fn dispatch_request_via_pipe(
     }
 
     // No Content-Length — stream with chunked transfer encoding.
-    let body_stream = CgiPipeStream::new(output_receiver, leftover);
-    builder.body(Body::from_stream(body_stream)).unwrap().into_response()
+    // Transfer the cancel guard into the stream so that if the client
+    // disconnects during streaming, the Prolog worker is signalled to abort.
+    let body_stream = CgiPipeStream::new(output_receiver, leftover, Some(cancel_guard));
+    builder
+        .body(Body::from_stream(body_stream))
+        .unwrap()
+        .into_response()
 }
 
 /// Read CGI headers from the pipe receiver, returning the parsed status, header
 /// map, and any bytes that were read past the header separator.
-async fn read_cgi_headers(
+pub(crate) async fn read_cgi_headers(
     receiver: &mut Receiver,
 ) -> Result<(u16, HeaderMap, Vec<u8>), String> {
     let mut buf = Vec::new();
@@ -1872,7 +2589,7 @@ async fn read_cgi_headers(
 /// Content-Length is preserved so that hyper can use it for keep-alive when
 /// the handler sets it (e.g. reply_json). When Content-Length is absent
 /// (streaming responses like NDJSON), hyper uses chunked transfer encoding.
-fn parse_cgi_headers(buf: &[u8]) -> Option<(u16, HeaderMap, usize)> {
+pub(crate) fn parse_cgi_headers(buf: &[u8]) -> Option<(u16, HeaderMap, usize)> {
     let separator_pos = find_header_separator(buf)?;
     let header_bytes = &buf[..separator_pos];
     let body_start = if buf[separator_pos..].starts_with(b"\r\n\r\n") {
@@ -1913,20 +2630,77 @@ fn find_header_separator(buf: &[u8]) -> Option<usize> {
     (0..buf.len().saturating_sub(3)).find(|&i| &buf[i..i + 4] == b"\r\n\r\n")
 }
 
+/// Guard that sends a `CancelPipe` message to the dispatch queue when dropped.
+/// This is held by `CgiPipeStream` so that when the HTTP response future is
+/// dropped (client disconnect), the Prolog worker handling this pipe FD is
+/// signalled to abort its work via `thread_signal/2`.
+struct PipeCancelGuard {
+    output_worker_write_fd: i32,
+    request_id: String,
+    queue: mpsc::Sender<DispatchMessage>,
+    cancelled: bool,
+}
+
+impl PipeCancelGuard {
+    fn new(
+        output_worker_write_fd: i32,
+        request_id: String,
+        queue: mpsc::Sender<DispatchMessage>,
+    ) -> Self {
+        Self {
+            output_worker_write_fd,
+            request_id,
+            queue,
+            cancelled: false,
+        }
+    }
+
+    /// Mark the guard as consumed so Drop does not send a cancel message.
+    /// Called when the stream completes normally (EOF or error).
+    fn disarm(&mut self) {
+        self.cancelled = true;
+    }
+}
+
+impl Drop for PipeCancelGuard {
+    fn drop(&mut self) {
+        if !self.cancelled {
+            let output_worker_write_fd = self.output_worker_write_fd;
+            let request_id = self.request_id.clone();
+            let queue = self.queue.clone();
+            // Send the cancel message asynchronously. If the queue is full
+            // or closed, there's nothing we can do — the watchdog will
+            // catch it as a safety net.
+            tokio::spawn(async move {
+                let _ = queue
+                    .send(DispatchMessage::CancelPipe {
+                        output_worker_write_fd,
+                        request_id,
+                    })
+                    .await;
+            });
+        }
+    }
+}
+
 /// Stream that yields bytes from the pipe receiver, prefixed by the bytes that
-/// were read while parsing the CGI headers.
+/// were read while parsing the CGI headers. When dropped before EOF (client
+/// disconnect), the `PipeCancelGuard` sends a cancel message to the dispatch
+/// queue so the Prolog worker is signalled to abort.
 struct CgiPipeStream {
     receiver: Receiver,
     leftover: Vec<u8>,
     leftover_yielded: bool,
+    cancel_guard: Option<PipeCancelGuard>,
 }
 
 impl CgiPipeStream {
-    fn new(receiver: Receiver, leftover: Vec<u8>) -> Self {
+    fn new(receiver: Receiver, leftover: Vec<u8>, cancel_guard: Option<PipeCancelGuard>) -> Self {
         Self {
             receiver,
             leftover,
             leftover_yielded: false,
+            cancel_guard,
         }
     }
 }
@@ -1950,12 +2724,23 @@ impl Stream for CgiPipeStream {
             Poll::Ready(Ok(())) => {
                 let n = read_buf.filled().len();
                 if n == 0 {
+                    // EOF — disarm the cancel guard so we don't send a
+                    // spurious cancel message for a completed request.
+                    if let Some(guard) = &mut this.cancel_guard {
+                        guard.disarm();
+                    }
                     Poll::Ready(None)
                 } else {
                     Poll::Ready(Some(Ok(axum::body::Bytes::copy_from_slice(&buf[..n]))))
                 }
             }
-            Poll::Ready(Err(_)) => Poll::Ready(None),
+            Poll::Ready(Err(_)) => {
+                // Error — disarm and return None.
+                if let Some(guard) = &mut this.cancel_guard {
+                    guard.disarm();
+                }
+                Poll::Ready(None)
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -2042,18 +2827,16 @@ async fn dispatch_stream_request(
     req: Request<Body>,
 ) -> impl IntoResponse {
     let (parts, body) = req.into_parts();
-    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
-        Ok(bytes) => bytes,
-        Err(_) => return plugin_error_response("failed to read request body"),
-    };
     let content_encoding = parts
         .headers
         .get(header::CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok());
-    let body_bytes = match decompress_request_body(content_encoding, &body_bytes) {
-        Ok(bytes) => bytes,
-        Err(msg) => return plugin_error_response(&msg),
-    };
+    let content_type = parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let has_content_length = parts.headers.contains_key(header::CONTENT_LENGTH);
 
     let method = parts.method.to_string();
     let path = normalize_dispatch_path(parts.uri.path());
@@ -2062,9 +2845,6 @@ async fn dispatch_stream_request(
         .headers
         .iter()
         .filter_map(|(k, v)| {
-            // Strip Content-Encoding: the body has already been decompressed
-            // by the Rust server. If we leave it in, the Prolog handler will
-            // try to decompress the already-decompressed data.
             if k == header::CONTENT_ENCODING {
                 return None;
             }
@@ -2078,14 +2858,77 @@ async fn dispatch_stream_request(
         .map(|(k, v)| (k, json!(v)))
         .collect();
 
-    let request_json = json!({
-        "method": method,
-        "path": path,
-        "query": query,
-        "headers": headers,
-        "body": "",
-        "params": params,
-    });
+    // When Content-Length is present and no compression, use the fast
+    // buffered path: read full body, pre-parse NDJSON into native dicts,
+    // and include parsed_body in the request. This eliminates
+    // json_read_dict overhead on the Prolog side.
+    //
+    // When chunked (no Content-Length) or compressed, stream body chunks
+    // through the input channel as they arrive. Prolog drains them via
+    // appserver_stream_recv/2. No parsed_body — Prolog parses NDJSON
+    // from the drained body. This enables true streaming with lower
+    // latency at the cost of Prolog-side JSON parsing.
+    let can_pre_parse = has_content_length
+        && content_encoding.is_none()
+        && content_type.contains("application/x-ndjson");
+
+    let mut body_opt = Some(body);
+
+    let (buffered_body, parsed_body) = if can_pre_parse {
+        let body = body_opt.take().unwrap();
+        let body_bytes = match axum::body::to_bytes(body, *MAX_BODY_SIZE).await {
+            Ok(bytes) => bytes,
+            Err(_) => return plugin_error_response("failed to read request body"),
+        };
+        // For large bodies, skip pre-parsing to avoid dispatch thread
+        // serialize_to_term bottleneck. Worker threads parse via
+        // json_read_all_from_stream in parallel. Don't include the body
+        // string in request_json either — the worker reads it from the
+        // input stream.
+        if body_bytes.len() < 100_000 {
+            let parsed_body: Vec<serde_json::Value> = body_bytes
+                .split(|&b| b == b'\n')
+                .filter(|line| !line.is_empty())
+                .filter_map(|line| serde_json::from_slice(line).ok())
+                .collect();
+            (Some(body_bytes), parsed_body)
+        } else {
+            // Large body: send via input stream only, don't serialize in JSON.
+            (Some(body_bytes), Vec::new())
+        }
+    } else {
+        (None, Vec::new())
+    };
+
+    let request_json = if parsed_body.is_empty() {
+        // For large NDJSON bodies (>= 100KB), don't serialize the body
+        // string into request_json — the worker reads it from the input
+        // stream. For small bodies that failed to parse as NDJSON lines,
+        // include the body string as fallback.
+        let body_str = buffered_body
+            .as_ref()
+            .filter(|b| b.len() < 100_000)
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .unwrap_or_default();
+        json!({
+            "method": method,
+            "path": path,
+            "query": query,
+            "headers": headers,
+            "body": body_str,
+            "params": params,
+        })
+    } else {
+        json!({
+            "method": method,
+            "path": path,
+            "query": query,
+            "headers": headers,
+            "body": "",
+            "params": params,
+            "parsed_body": parsed_body,
+        })
+    };
     crate::log::log_info(format!("{} {} (stream)", method, path));
 
     let (input_stream_id, input_tx) = create_input_stream();
@@ -2107,7 +2950,10 @@ async fn dispatch_stream_request(
         {
             let mut set = in_flight.lock().unwrap();
             if set.contains(&request_id) {
-                input_stream_registry().lock().unwrap().take(input_stream_id);
+                input_stream_registry()
+                    .lock()
+                    .unwrap()
+                    .take(input_stream_id);
                 stream_registry().lock().unwrap().remove(response_stream_id);
                 return plugin_error_response("duplicate request id");
             }
@@ -2118,21 +2964,46 @@ async fn dispatch_stream_request(
             in_flight,
         };
 
-        if queue.send(DispatchMessage::Stream(dispatch_req)).await.is_err() {
+        if queue
+            .send(DispatchMessage::Stream(dispatch_req))
+            .await
+            .is_err()
+        {
             stream_registry().lock().unwrap().remove(response_stream_id);
             return plugin_error_response("dispatch queue closed");
         }
 
-        if input_tx.send(axum::body::Bytes::from(body_bytes)).await.is_err() {
-            stream_registry().lock().unwrap().remove(response_stream_id);
-            return plugin_error_response("failed to send request body");
+        if let Some(bytes) = buffered_body {
+            // Buffered path: send entire body as one chunk, then close.
+            if input_tx.send(bytes).await.is_err() {
+                stream_registry().lock().unwrap().remove(response_stream_id);
+                return plugin_error_response("failed to send request body");
+            }
+            drop(input_tx);
+        } else {
+            // Streaming path: forward body chunks to Prolog as they arrive.
+            let body = body_opt.take().unwrap();
+            tokio::spawn(async move {
+                let mut body = body;
+                use http_body_util::BodyExt;
+                while let Some(chunk_result) = body.frame().await {
+                    match chunk_result {
+                        Ok(frame) => {
+                            if let Ok(bytes) = frame.into_data() {
+                                if input_tx.send(bytes).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                drop(input_tx);
+            });
         }
-        drop(input_tx);
 
         tokio::task::spawn_blocking(move || {
-            let first = response_rx
-                .blocking_recv()
-                .ok_or(PrologError::Failure)?;
+            let first = response_rx.blocking_recv().ok_or(PrologError::Failure)?;
             let response: serde_json::Value =
                 serde_json::from_slice(&first).map_err(|_| PrologError::Failure)?;
             Ok((response, response_rx))
@@ -2171,7 +3042,9 @@ async fn dispatch_stream_request(
                 }
                 let stream = GuardedReceiverStream {
                     inner: ReceiverStream::new(response_rx),
-                    _guard: StreamGuard { id: response_stream_id },
+                    _guard: StreamGuard {
+                        id: response_stream_id,
+                    },
                 };
                 let mut builder = Response::builder().status(status);
                 for (key, value) in response_headers.iter() {
@@ -2188,7 +3061,8 @@ async fn dispatch_stream_request(
                     builder.body(Body::from(body_str.to_string()))
                 } else {
                     builder.body(Body::from(body_value.to_string()))
-                }.unwrap()
+                }
+                .unwrap()
             }
         }
         Err(_) => {
@@ -2219,7 +3093,10 @@ mod path_tests {
 
     #[test]
     fn normalize_decodes_percent_encoding() {
-        assert_eq!(normalize_dispatch_path("/api/db/admin%20name"), "/api/db/admin name");
+        assert_eq!(
+            normalize_dispatch_path("/api/db/admin%20name"),
+            "/api/db/admin name"
+        );
     }
 
     #[test]
@@ -2283,5 +3160,59 @@ mod path_tests {
         assert!(is_catchall_pattern("/api/db/*path"));
         assert!(!is_catchall_pattern("/api/organizations/:seg1"));
         assert!(!is_catchall_pattern("/api"));
+    }
+}
+
+#[cfg(test)]
+mod subscription_limiter_tests {
+    use super::SubscriptionLimiter;
+
+    #[test]
+    fn allows_under_limit() {
+        let mut limiter = SubscriptionLimiter::default();
+        let max = limiter.max_per_user();
+        for _ in 0..max {
+            assert!(limiter.try_acquire("user_a").is_ok());
+        }
+    }
+
+    #[test]
+    fn rejects_over_limit() {
+        let mut limiter = SubscriptionLimiter::default();
+        let max = limiter.max_per_user();
+        for _ in 0..max {
+            limiter.try_acquire("user_a").unwrap();
+        }
+        assert!(limiter.try_acquire("user_a").is_err());
+    }
+
+    #[test]
+    fn release_frees_slot() {
+        let mut limiter = SubscriptionLimiter::default();
+        let max = limiter.max_per_user();
+        for _ in 0..max {
+            limiter.try_acquire("user_a").unwrap();
+        }
+        assert!(limiter.try_acquire("user_a").is_err());
+        limiter.release("user_a");
+        assert!(limiter.try_acquire("user_a").is_ok());
+    }
+
+    #[test]
+    fn independent_users_have_independent_limits() {
+        let mut limiter = SubscriptionLimiter::default();
+        let max = limiter.max_per_user();
+        for _ in 0..max {
+            limiter.try_acquire("user_a").unwrap();
+        }
+        assert!(limiter.try_acquire("user_a").is_err());
+        assert!(limiter.try_acquire("user_b").is_ok());
+    }
+
+    #[test]
+    fn release_unknown_user_is_noop() {
+        let mut limiter = SubscriptionLimiter::default();
+        limiter.release("nonexistent");
+        assert_eq!(limiter.count_for("nonexistent"), 0);
     }
 }

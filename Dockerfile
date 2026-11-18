@@ -2,18 +2,22 @@
 
 # Community-only Docker build.
 # Set the swipl version by argument (see Makefile for the default!)
-ARG SWIPL_VERSION=10.0.1
+ARG SWIPL_VERSION=10.0.2
 ARG SKIP_TESTS=false
+# No defaults: the UI pins live in UI_VERSIONS and are passed via --build-arg
+# by 'make docker' and CI.
+ARG TDB_ADMIN_VERSION
+ARG TDB_DATA_VERSION
 
 # Minimal SWI-Prolog
 FROM swipl:${SWIPL_VERSION} AS swipl_minimal
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends libjwt0
+    apt-get install -y --no-install-recommends ca-certificates
 
 # Install the SWI-Prolog pack dependencies.
 FROM swipl_minimal AS pack_installer
 RUN set -eux; \
-    BUILD_DEPS="git curl build-essential make libjwt-dev libssl-dev \
+    BUILD_DEPS="git curl build-essential make libssl-dev \
     pkg-config clang ca-certificates m4 libgmp-dev \
     protobuf-compiler libprotobuf-dev"; \
     apt-get update; \
@@ -33,22 +37,77 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 RUN curl https://sh.rustup.rs -sSf | bash -s -- -y --profile minimal
 ENV PATH="/root/.cargo/bin:${PATH}"
-# Initialize the crates.io index git repo to cache it.
-RUN (cargo install lazy_static 2> /dev/null || true) && (cargo install cargo-swipl || true)
+# cargo-chef splits dependency compilation from workspace compilation: the
+# dependency layer survives source edits and is only invalidated when the
+# lockfile or a workspace manifest changes. Also initialize the crates.io
+# index git repo to cache it.
+RUN (cargo install lazy_static 2> /dev/null || true) && \
+    (cargo install cargo-swipl || true) && \
+    cargo install cargo-chef --locked
 WORKDIR /app/rust
-COPY distribution/Makefile.rust Makefile
-COPY src/rust src/rust/
 
-# Build the community dylib.
-FROM rust_builder_base AS rust_builder
+# Dependency recipe: derived only from workspace manifests and Cargo.lock.
+FROM rust_builder_base AS rust_planner
+COPY src/rust src/rust/
+RUN cd src/rust && cargo chef prepare --recipe-path /app/rust/recipe.json
+
+# Compile all dependencies once; reused until the lockfile changes.
+FROM rust_builder_base AS rust_deps
+COPY --from=rust_planner /app/rust/recipe.json src/rust/recipe.json
+# --all-targets cooks the dev-dep graph too (tower/axum/tonic for tests);
+# without it `cargo swipl test` recompiles shared deps under test features.
+RUN cd src/rust && cargo chef cook --release --all-targets --recipe-path recipe.json
+
+# Build the community dylib. Sources land on top of the cached dependency
+# layer, so only workspace crates recompile. The target dir is deleted
+# afterwards to keep this layer thin under cache-to mode=max.
+FROM rust_deps AS rust_builder
 ARG CARGO_NET_GIT_FETCH_WITH_CLI=true
 ARG SKIP_TESTS=false
-RUN make DIST=community && ([ "$SKIP_TESTS" = "true" ] || (cd src/rust && cargo swipl test --release))
+COPY distribution/Makefile.rust Makefile
+COPY src/rust src/rust/
+# Vectorlink tests resolve builtin plugin assets relative to the crate dir.
+COPY builtin_plugins/assets builtin_plugins/assets/
+# TERMINUSDB_ENABLE_OPTIMIZER=false keeps the in-build plunit runs
+# deterministic (probabilistic optimize/GC would otherwise fire mid-test).
+RUN TERMINUSDB_ENABLE_OPTIMIZER=false make DIST=community && \
+    ([ "$SKIP_TESTS" = "true" ] || (cd src/rust && TERMINUSDB_ENABLE_OPTIMIZER=false cargo swipl test --release)) && \
+    rm -rf src/rust/target
+RUN strip --strip-debug src/rust/librust.so
+
+# Download the pre-built tdb-admin dist package from GitHub releases.
+FROM alpine:latest AS admin_dist
+ARG TDB_ADMIN_VERSION
+RUN : "${TDB_ADMIN_VERSION:?TDB_ADMIN_VERSION build-arg required — pin lives in UI_VERSIONS (use 'make docker')}"
+RUN apk add --no-cache curl tar
+RUN TDB_ADMIN_VER="${TDB_ADMIN_VERSION#v}" && \
+    mkdir -p /admin/dist && \
+    curl -fsSL "https://github.com/terminusdb-org/tdb-admin/releases/download/${TDB_ADMIN_VERSION}/tdb-admin-${TDB_ADMIN_VER}.tar.gz" \
+    | tar xzf - -C /admin/dist
+
+# Download the pre-built tdb-data dist package from GitHub releases.
+FROM alpine:latest AS data_dist
+ARG TDB_DATA_VERSION
+RUN : "${TDB_DATA_VERSION:?TDB_DATA_VERSION build-arg required — pin lives in UI_VERSIONS (use 'make docker')}"
+RUN apk add --no-cache curl tar
+RUN TDB_DATA_VER="${TDB_DATA_VERSION#v}" && \
+    mkdir -p /data/dist && \
+    curl -fsSL "https://github.com/terminusdb-org/tdb-data/releases/download/${TDB_DATA_VERSION}/tdb-data-${TDB_DATA_VER}.tar.gz" \
+    | tar xzf - -C /data/dist
+
+# Build the dashboard (converts openapi.yaml to openapi.json)
+FROM node:22-slim AS dashboard_build
+WORKDIR /app/dashboard
+COPY dashboard/package.json dashboard/package-lock.json ./
+RUN npm ci --omit=dev
+COPY dashboard/build.js .
+COPY docs/openapi.yaml ../docs/openapi.yaml
+RUN node build.js
 
 # Copy the packs and dylib. Prepare to build the Prolog code.
 FROM pack_installer AS base
 RUN set -eux; \
-    RUNTIME_DEPS="libjwt0 make openssl binutils ca-certificates"; \
+    RUNTIME_DEPS="make openssl binutils ca-certificates"; \
     apt-get update; \
     apt-get upgrade -y; \
     apt-get install -y --no-install-recommends ${RUNTIME_DEPS}; \
@@ -62,6 +121,8 @@ WORKDIR /app/terminusdb
 COPY distribution/init_docker.sh distribution/
 COPY distribution/Makefile.prolog Makefile
 COPY src src/
+COPY plugins plugins/
+COPY builtin_plugins builtin_plugins/
 COPY --from=rust_builder /app/rust/src/rust/librust.so src/rust/
 
 # Build the community executable.
@@ -70,32 +131,39 @@ ARG SKIP_TESTS=false
 COPY --from=rust_builder /app/rust/src/rust/librust.so src/rust/
 RUN set -eux; \
     make DIST=community; \
-    [ "$SKIP_TESTS" = "true" ] || make test
+    [ "$SKIP_TESTS" = "true" ] || TERMINUSDB_ENABLE_OPTIMIZER=false make test
 
 FROM swipl_minimal AS min_community
 COPY --from=base_community /app/terminusdb/terminusdb /app/terminusdb/
+COPY --from=rust_builder /app/rust/src/rust/librust.so /app/terminusdb/src/rust/librust.so
 
 FROM min_community
 COPY --from=base_community /app/terminusdb/terminusdb /app/terminusdb/
+COPY --from=rust_builder /app/rust/src/rust/librust.so /app/terminusdb/src/rust/librust.so
 COPY --from=base_community /app/terminusdb/src/terminus-schema /app/terminusdb/src/terminus-schema/
 COPY --from=base_community /app/terminusdb/distribution/init_docker.sh /app/terminusdb/init_docker.sh
 
 RUN set -eux; \
-    RUNTIME_DEPS="libjwt0 make openssl binutils ca-certificates"; \
+    RUNTIME_DEPS="make openssl binutils ca-certificates"; \
     apt-get update; \
     apt-get upgrade -y; \
     apt-get install -y --no-install-recommends ${RUNTIME_DEPS}; \
     rm -rf /var/cache/apt/*; \
     rm -rf /var/lib/apt/lists/*
-COPY --from=pack_installer /usr/share/swi-prolog/pack/jwt_io /usr/share/swi-prolog/pack/jwt_io
 COPY --from=pack_installer /usr/share/swi-prolog/pack/tus /usr/share/swi-prolog/pack/tus
 
 WORKDIR /app/terminusdb
 RUN mkdir -p storage \
     && chown -R 1000:1000 storage
 ENV TERMINUSDB_PLUGINS_PATH=${TERMINUSDB_PLUGINS_PATH:-/plugins}
-COPY docker/plugins/auto-optimize.pl ${TERMINUSDB_PLUGINS_PATH}/
-RUN mkdir -p /app/terminusdb/dashboard/assets
-COPY dashboard/src/index.html /app/terminusdb/dashboard/
-COPY dashboard/src/output.css /app/terminusdb/dashboard/assets/
+ENV TERMINUSDB_LISTEN_ADDRESS=0.0.0.0
+ENV TERMINUSDB_BUILTIN_PLUGINS_PATH=${TERMINUSDB_BUILTIN_PLUGINS_PATH:-/builtin_plugins}
+COPY builtin_plugins/ ${TERMINUSDB_BUILTIN_PLUGINS_PATH}/
+RUN mkdir -p /app/terminusdb/dashboard/src/assets
+COPY dashboard/src/index.html dashboard/src/api.html /app/terminusdb/dashboard/src/
+COPY dashboard/src/output.css /app/terminusdb/dashboard/src/assets/
+COPY dashboard/src/assets/scalar-init.js /app/terminusdb/dashboard/src/assets/
+COPY --from=dashboard_build /app/dashboard/src/assets/openapi.json /app/terminusdb/dashboard/src/assets/
+COPY --from=admin_dist /admin/dist /app/terminusdb/app/admin/dist
+COPY --from=data_dist /data/dist /app/terminusdb/app/data/dist
 CMD ["/app/terminusdb/init_docker.sh"]

@@ -10,7 +10,12 @@
 :- use_module(core(triple)).
 :- use_module(core(document/meta_commit_queue)).
 :- use_module(core(document/commit_queue), [
-                  enqueue_commit/2
+                  enqueue_commit/2,
+                  schedule_database_optimization_with_reply/2,
+                  database_active_branch_count/2,
+                  branch_queue_empty/1,
+                  increment_database_active_count/1,
+                  decrement_database_active_count/1
               ]).
 :- use_module(core(api/api_document), [
                   producer_timeout/1,
@@ -47,21 +52,26 @@ api_optimize(SystemDB, Auth, Path) :-
         descriptor_optimize(Descriptor)
     ).
 
-% api_optimize_queued/3 is the API entry point that routes the optimization
-% through the branch commit queue for branch descriptors. Non-branch descriptors
-% (system, database, repository) fall back to the synchronous api_optimize/3
-% because they have no branch queue to serialize on. This removes the direct
-% meta_commit_lock acquisition from the request thread for branch optimizes.
+% api_optimize_queued/3 is the API entry point that routes ALL descriptor
+% types through the commit queue scheduling system. Branch descriptors use
+% the branch commit queue via enqueue_commit. Non-branch descriptors
+% (system, database, repository) use schedule_database_optimization which
+% places work on the database or global optimization queue, processed by
+% idle commit workers. Both paths wait for completion with a timeout.
+%
+% This avoids blocking HTTP worker threads with synchronous meta_commit_lock
+% acquisition, which was causing 25+ second delays when multiple optimize
+% calls competed for the same lock.
 api_optimize_queued(SystemDB, Auth, Path) :-
     do_or_die(
         resolve_absolute_string_descriptor(Path, Descriptor),
         error(invalid_absolute_path(Path),_)),
     check_optimize_auth(SystemDB, Auth, Descriptor),
     (   branch_descriptor{} :< Descriptor
-    ->  submit_queued_optimize(Descriptor, Path, Result),
+    ->  submit_branch_optimize(Descriptor, Path, Result),
         handle_optimize_result(Result)
-    ;   descriptor_lock_key(Descriptor, Lock_Key),
-        with_meta_commit_lock(Lock_Key, descriptor_optimize(Descriptor))
+    ;   submit_scheduled_optimize(Descriptor, Result),
+        handle_optimize_result(Result)
     ).
 
 check_optimize_auth(SystemDB, Auth, Descriptor) :-
@@ -81,6 +91,32 @@ check_optimize_auth(SystemDB, Auth, Descriptor) :-
         ),
         error(not_a_valid_descriptor_for_optimization(Descriptor),_)).
 
+% submit_branch_optimize(+Descriptor, +Path, -Result) is det.
+%
+% For branch descriptors:
+%   - If the branch queue is empty (no pending commits), run the optimization
+%     directly in the current thread under the meta_commit_lock. This avoids
+%     the 8+ second scheduling overhead of routing through the commit queue
+%     when there is no concurrent work to conflict with.
+%   - If there ARE pending commits on the branch queue, enqueue the optimization
+%     through the commit queue so it runs after pending commits drain.
+submit_branch_optimize(Descriptor, Path, Result) :-
+    (   commit_queue:branch_queue_empty(Path)
+    ->  descriptor_lock_key(Descriptor, DatabaseKey),
+        commit_queue:increment_database_active_count(DatabaseKey),
+        call_cleanup(
+            catch(
+                (   with_meta_commit_lock(DatabaseKey, descriptor_optimize(Descriptor)),
+                    Result = optimize_success
+                ),
+                Error,
+                Result = error(Error)
+            ),
+            commit_queue:decrement_database_active_count(DatabaseKey)
+        )
+    ;   submit_queued_optimize(Descriptor, Path, Result)
+    ).
+
 submit_queued_optimize(Descriptor, Path, Result) :-
     descriptor_lock_key(Descriptor, Database_Key),
     message_queue_create(ReplyQueue, []),
@@ -97,12 +133,53 @@ submit_queued_optimize(Descriptor, Path, Result) :-
     producer_timeout(ProducerTimeout),
     (   get_commit_result(ReplyQueue, RequestId, ProducerTimeout, Result)
     ->  true
-    ;   Result = timeout
+    ;   Result = timeout(RequestId)
     ),
     catch(message_queue_destroy(ReplyQueue), _, true).
 
+% submit_scheduled_optimize(+Descriptor, -Result) is det.
+%
+% For non-branch descriptors (system, database, repository):
+%   - If there are no active branches for this database, run the optimization
+%     directly in the current thread under the meta_commit_lock. This avoids
+%     the 8-14s scheduling overhead of routing through the commit queue when
+%     there is no concurrent work to conflict with.
+%   - If there ARE active branches, schedule through the commit queue so the
+%     optimization runs after pending commits drain, and wait for the result.
+submit_scheduled_optimize(Descriptor, Result) :-
+    descriptor_lock_key(Descriptor, DatabaseKey),
+    (   commit_queue:database_active_branch_count(DatabaseKey, Count),
+        Count > 0
+    ->  message_queue_create(ReplyQueue, []),
+        gensym(request, RequestId),
+        OptRecord = optimize_record{
+            descriptor: Descriptor,
+            reply_queue: ReplyQueue,
+            request_id: RequestId
+        },
+        commit_queue:schedule_database_optimization_with_reply(Descriptor, OptRecord),
+        producer_timeout(ProducerTimeout),
+        (   get_commit_result(ReplyQueue, RequestId, ProducerTimeout, Result)
+        ->  true
+        ;   Result = timeout(RequestId)
+        ),
+        catch(message_queue_destroy(ReplyQueue), _, true)
+    ;   commit_queue:increment_database_active_count(DatabaseKey),
+        call_cleanup(
+            catch(
+                (   with_meta_commit_lock(DatabaseKey, descriptor_optimize(Descriptor)),
+                    Result = optimize_success
+                ),
+                Error,
+                Result = error(Error)
+            ),
+            commit_queue:decrement_database_active_count(DatabaseKey)
+        )
+    ).
+
 handle_optimize_result(optimize_success) :- !.
 handle_optimize_result(error(Error)) :- throw(error(Error, _)).
+handle_optimize_result(timeout(RequestId)) :- throw(error(commit_queue_timeout(RequestId), _)).
 handle_optimize_result(timeout) :- throw(error(commit_queue_timeout, _)).
 
 % run_queued_optimize(+Package) is det.
@@ -238,9 +315,12 @@ descriptor_optimize(repository_descriptor{
         terminus_store:invalidate_layer_cache_entry(Store, Layer_Id)
     ;   true
     ),
-    % Clear caches
-    retractall(descriptor:retained_descriptor_layers(Descriptor, _)),
-    abolish_all_tables.
+    % Clear per-descriptor retained layer references.
+    % Note: abolish_all_tables is intentionally NOT called here.
+    % Global table abolition is too expensive for the optimize path
+    % since it destroys tabled results for ALL databases. Table
+    % cleanup is handled by the GC path in the auto-optimize plugin.
+    retractall(descriptor:retained_descriptor_layers(Descriptor, _)).
 descriptor_optimize(branch_descriptor{
                         repository_descriptor : Repository_Descriptor,
                         branch_name : Branch_Name
@@ -284,9 +364,8 @@ descriptor_optimize(branch_descriptor{
             terminus_store:invalidate_layer_cache_entry(Store, Layer_Id)
         )
     ),
-    % Clear caches that hold references to old deep-chain layers
+    % Clear per-descriptor retained layer references.
     retractall(descriptor:retained_descriptor_layers(Descriptor, _)),
-    abolish_all_tables,
     % Also roll up the repository layer (commit graph) to prevent O(n) traversal.
     % The commit graph accumulates child layers with each commit.
     % Rollup is safe here because it only creates parallel files - it does NOT
@@ -304,9 +383,7 @@ descriptor_optimize(branch_descriptor{
         terminus_store:invalidate_layer_cache_entry(Store, Repo_Layer_Id),
         % Clear retained layers for all descriptors in the chain
         retractall(descriptor:retained_descriptor_layers(Repository_Descriptor, _)),
-        retractall(descriptor:retained_descriptor_layers(Descriptor, _)),
-        % Also clear tables that cache predicate results keyed by layers
-        abolish_all_tables
+        retractall(descriptor:retained_descriptor_layers(Descriptor, _))
     ;   true).
 
 % Write a generator that gives us back Start and Stop positions as commit_ids

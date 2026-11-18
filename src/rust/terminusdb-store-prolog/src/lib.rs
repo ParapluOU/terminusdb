@@ -40,6 +40,7 @@ pub fn install(module: Option<&str>) {
     layer::register_predicate_count_in_module(module);
     layer::register_subject_to_id_in_module(module);
     layer::register_id_to_subject_in_module(module);
+    layer::register_subject_with_prefix_in_module(module);
     layer::register_predicate_to_id_in_module(module);
     layer::register_id_to_predicate_in_module(module);
     layer::register_object_to_id_in_module(module);
@@ -63,11 +64,15 @@ pub fn install(module: Option<&str>) {
     store::register_pack_export_in_module(module);
     store::register_pack_layerids_and_parents_in_module(module);
     store::register_pack_import_in_module(module);
+    store::register_create_empty_base_layer_in_module(module);
     layer::register_id_triple_in_module(module);
     layer::register_id_triple_addition_in_module(module);
     layer::register_id_triple_removal_in_module(module);
     layer::register_id_triple_value_range_in_module(module);
     layer::register_id_triple_value_range_rev_in_module(module);
+    layer::register_id_triple_count_in_module(module);
+    layer::register_id_triple_value_range_count_in_module(module);
+    layer::register_id_triple_interval_relation_in_module(module);
     layer::register_id_triple_sp_value_next_in_module(module);
     layer::register_id_triple_sp_value_previous_in_module(module);
     layer::register_sp_card_in_module(module);

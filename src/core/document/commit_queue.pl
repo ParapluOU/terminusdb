@@ -24,12 +24,18 @@
               active_branch/2,
               pending_branches/1,
               schedule_database_optimization/1,
-              schedule_branch_optimization/1
+              schedule_database_optimization_with_reply/2,
+              schedule_branch_optimization/1,
+              branch_queue_empty/1,
+              database_active_branch_count/2,
+              increment_database_active_count/1,
+              decrement_database_active_count/1
           ]).
 
 :- use_module(config(terminus_config), [worker_amount/1]).
 :- use_module(core(util)).
-:- use_module(core(util/test_utils), [setup_temp_store/1, teardown_temp_store/1]).
+:- use_module(core(util/test_utils), [setup_temp_store/1, teardown_temp_store/1,
+                                     with_quiet_user_error/1]).
 :- use_module(core(triple), [triple_store/1, with_triple_store/2]).
 :- use_module(core(transaction/descriptor), [branch_key_from_descriptor/2]).
 :- use_module(core(triple/database_utils), [organization_database_name/3]).
@@ -43,6 +49,11 @@
 % Branch-specific commit queue and lock registry.
 :- dynamic branch_commit_queue/2.
 :- dynamic branch_commit_lock/2.
+% branch_registry_touch(BranchKey, Time) — last activity stamp per branch
+% queue/lock pair; drives the idle-TTL sweep. branch_registry_last_sweep/1
+% rate-limits the sweep itself.
+:- dynamic branch_registry_touch/2.
+:- dynamic branch_registry_last_sweep/1.
 
 % Round-robin scheduler state.
 :- dynamic pending_branches/1.
@@ -68,6 +79,11 @@
 % workers through a global task queue.
 :- dynamic pending_global_optimization/2.
 :- dynamic pending_global_optimization_due/1.
+
+% pending_optimization_reply(DatabaseKey, ReplyRecord) holds an optional
+% reply queue for a scheduled optimization. When set, run_database_optimization
+% sends the result back to the reply queue after completion.
+:- dynamic pending_optimization_reply/2.
 
 % database_active_branch_count(DatabaseKey, Count) tracks how many branches of
 % a given database currently have an active commit worker. Used to know when a
@@ -103,8 +119,12 @@ wake_workers :-
 
 ensure_branch_queue(BranchKey, Queue) :-
     (   branch_commit_queue(BranchKey, Queue)
-    ->  true
-    ;   with_mutex(branch_registry_mutex,
+    ->  touch_branch_registry(BranchKey)
+    ;   % The sweep must run before taking the registry mutex: it evicts by
+        % re-acquiring that mutex per candidate, and SWI mutexes are not
+        % recursive.
+        maybe_sweep_branch_registry,
+        with_mutex(branch_registry_mutex,
             (   branch_commit_queue(BranchKey, Queue)
             ->  true
             ;   atom_string(BranchKeyAtom, BranchKey),
@@ -124,26 +144,122 @@ ensure_branch_queue(BranchKey, Queue) :-
                     throw(error(unable_to_create_branch_lock(BranchKey), _))
                 ),
                 assertz(branch_commit_queue(BranchKey, Queue)),
-                assertz(branch_commit_lock(BranchKey, Mutex))
+                assertz(branch_commit_lock(BranchKey, Mutex)),
+                touch_branch_registry(BranchKey)
             ))
     ).
 
-destroy_branch_queue(BranchKey) :-
+%% Expiry: a created branch queue + lock pair lives for the process
+%% lifetime unless removed. Entries expire two ways: delete-driven
+%% (plugins:post_delete_db_hook/2 destroys every branch queue of a
+%% deleted database) and TTL-driven (the lazy sweep evicts branches idle
+%% longer than branch_registry_ttl). A branch is only evicted when it has
+%% no queued work, is not on the pending list, and is not active — the
+%% sweep never drops an undrained commit.
+
+branch_registry_ttl(Secs) :-
+    (   getenv('TERMINUSDB_REGISTRY_TTL', V),
+        atom_number(V, N)
+    ->  Secs = N
+    ;   Secs = 600
+    ).
+
+touch_branch_registry(BranchKey) :-
+    get_time(Now),
+    retractall(branch_registry_touch(BranchKey, _)),
+    assertz(branch_registry_touch(BranchKey, Now)).
+
+maybe_sweep_branch_registry :-
+    get_time(Now),
+    (   branch_registry_last_sweep(Last),
+        Now - Last < 60
+    ->  true
+    ;   retractall(branch_registry_last_sweep(_)),
+        assertz(branch_registry_last_sweep(Now)),
+        sweep_branch_registry_at(Now)
+    ).
+
+sweep_branch_registry :-
+    get_time(Now),
+    sweep_branch_registry_at(Now).
+
+sweep_branch_registry_at(Now) :-
+    branch_registry_ttl(TTL),
+    forall(
+        (   branch_commit_queue(BranchKey, _),
+            (   branch_registry_touch(BranchKey, Touched)
+            ->  Now - Touched > TTL
+            ;   true  % untracked entry — treat as stale
+            )
+        ),
+        expire_branch_queue_if_idle(BranchKey, Now, TTL)
+    ),
+    forall(
+        (   branch_registry_touch(BranchKey, _),
+            \+ branch_commit_queue(BranchKey, _)
+        ),
+        retractall(branch_registry_touch(BranchKey, _))
+    ).
+
+%% expire_branch_queue_if_idle(+BranchKey, +Now, +TTL) is det.
+%%
+%% Re-checks idleness inside the registry mutex so a commit that lands
+%% between the sweep's candidate scan and eviction is not dropped. The
+%% scheduler-state check nests scheduler inside registry — safe because
+%% no commit_scheduler_mutex scope ever acquires branch_registry_mutex.
+expire_branch_queue_if_idle(BranchKey, Now, TTL) :-
     with_mutex(branch_registry_mutex,
-        (   (   branch_commit_queue(BranchKey, Queue)
-            ->  drain_message_queue(Queue),
-                catch(message_queue_destroy(Queue), _, true),
-                retractall(branch_commit_queue(BranchKey, _))
+        (   branch_commit_queue(BranchKey, Queue),
+            queue_empty(Queue),
+            (   branch_registry_touch(BranchKey, Touched)
+            ->  Now - Touched > TTL
             ;   true
             ),
-            (   branch_commit_lock(BranchKey, Mutex)
-            ->  catch(mutex_unlock(Mutex), _, true),
-                catch(mutex_destroy(Mutex), _, true),
-                retractall(branch_commit_lock(BranchKey, _))
+            branch_registry_not_busy(BranchKey)
+        ->  destroy_branch_registry_state(BranchKey),
+            Expired = true
+        ;   Expired = false
+        )),
+    (   Expired = true
+    ->  cleanup_scheduler_state_for_branch(BranchKey)
+    ;   true
+    ).
+
+branch_registry_not_busy(BranchKey) :-
+    with_mutex(commit_scheduler_mutex,
+        (   \+ active_branch(BranchKey, _),
+            (   pending_branches(Branches)
+            ->  \+ member(BranchKey, Branches)
             ;   true
             )
-        )),
-    cleanup_scheduler_state_for_branch(BranchKey).
+        )).
+
+destroy_branch_queue(BranchKey) :-
+    with_mutex(branch_registry_mutex,
+        destroy_branch_registry_state(BranchKey)),
+    cleanup_scheduler_state_for_branch(BranchKey),
+    retractall(branch_registry_touch(BranchKey, _)).
+
+% destroy_branch_registry_state(+BranchKey) is det.
+%
+% Tears down the queue/lock pair and their registry rows. Caller must hold
+% branch_registry_mutex. Residual race: a thread that read the lock row
+% just before the retract can still call mutex_lock on a destroyed mutex
+% and get an existence_error — such work targets a deleted/expired branch
+% and fails anyway.
+destroy_branch_registry_state(BranchKey) :-
+    (   branch_commit_queue(BranchKey, Queue)
+    ->  drain_message_queue(Queue),
+        catch(message_queue_destroy(Queue), _, true),
+        retractall(branch_commit_queue(BranchKey, _))
+    ;   true
+    ),
+    (   branch_commit_lock(BranchKey, Mutex)
+    ->  catch(mutex_unlock(Mutex), _, true),
+        catch(mutex_destroy(Mutex), _, true),
+        retractall(branch_commit_lock(BranchKey, _))
+    ;   true
+    ).
 
 drain_message_queue(Queue) :-
     catch(thread_get_message(Queue, _, [timeout(0)]), _, fail),
@@ -189,6 +305,17 @@ release_branch_lock(BranchKey) :-
 
 queue_empty(Queue) :-
     catch(message_queue_property(Queue, size(0)), _, fail).
+
+% branch_queue_empty(+BranchKey) is semidet.
+%
+% True when the branch queue for BranchKey does not exist or has no pending
+% messages. Used by the optimize endpoint to decide whether to run directly
+% or schedule through the commit queue.
+branch_queue_empty(BranchKey) :-
+    (   branch_commit_queue(BranchKey, Queue)
+    ->  queue_empty(Queue)
+    ;   true
+    ).
 
 enqueue_commit(BranchKey, Package) :-
     ensure_branch_queue(BranchKey, Queue),
@@ -324,11 +451,68 @@ decrement_database_active_branch_count(BranchKey, NewCount) :-
     ->  NewCount is Count - 1,
         (   NewCount < 0
         ->  throw(error(active_branch_count_negative(DatabaseKey), _))
-        ;   assertz(database_active_branch_count(DatabaseKey, NewCount))
+        ;   NewCount > 0
+        ->  assertz(database_active_branch_count(DatabaseKey, NewCount))
+        ;   true  % count reached zero — keep the row retracted
         )
-    ;   NewCount = 0,
-        assertz(database_active_branch_count(DatabaseKey, 0))
+    ;   % Decrement without a matching increment is unbalanced bookkeeping.
+        % Warn rather than minting a permanent zero row.
+        NewCount = 0,
+        json_log_warning_formatted(
+            "Active branch count decrement for ~w with no registered count",
+            [DatabaseKey])
     ).
+
+% increment_database_active_count(+DatabaseKey) is det.
+%
+% Increments the active work counter for a database key directly (without
+% going through a branch key). Used by the optimize endpoint to mark
+% optimization work as active so concurrent optimize requests schedule
+% through the commit queue instead of running directly.
+increment_database_active_count(DatabaseKey) :-
+    with_mutex(commit_scheduler_mutex,
+        (   retract(database_active_branch_count(DatabaseKey, Count))
+        ->  NewCount is Count + 1,
+            assertz(database_active_branch_count(DatabaseKey, NewCount))
+        ;   assertz(database_active_branch_count(DatabaseKey, 1))
+        )).
+
+% decrement_database_active_count(+DatabaseKey) is det.
+%
+% Decrements the active work counter for a database key directly.
+decrement_database_active_count(DatabaseKey) :-
+    with_mutex(commit_scheduler_mutex,
+        (   retract(database_active_branch_count(DatabaseKey, Count))
+        ->  NewCount is Count - 1,
+            (   NewCount < 0
+            ->  throw(error(active_branch_count_negative(DatabaseKey), _))
+            ;   NewCount > 0
+            ->  assertz(database_active_branch_count(DatabaseKey, NewCount))
+            ;   true  % count reached zero — keep the row retracted
+            )
+        ;   json_log_warning_formatted(
+                "Active count decrement for ~w with no registered count",
+                [DatabaseKey])
+        )).
+
+% Delete-driven expiry: a database deleted while it still has an active
+% branch count row, branch queues, or branch locks (delete raced in-flight
+% work) would otherwise leak them forever — no decrement is coming for a
+% dead database. Branch queues are destroyed first so their cleanup can
+% still decrement the count normally; the remaining row is then retracted.
+:- multifile plugins:post_delete_db_hook/2.
+plugins:post_delete_db_hook(Organization, DB_Name) :-
+    atomic_list_concat([Organization, '/', DB_Name, '/'], '', PrefixAtom),
+    forall(
+        (   branch_commit_queue(BranchKey, _),
+            atom_string(BranchAtom, BranchKey),
+            sub_atom(BranchAtom, 0, _, _, PrefixAtom)
+        ),
+        destroy_branch_queue(BranchKey)
+    ),
+    organization_database_name(Organization, DB_Name, DatabaseKey),
+    with_mutex(commit_scheduler_mutex,
+        retractall(database_active_branch_count(DatabaseKey, _))).
 
 % Optimization scheduling.
 %
@@ -364,7 +548,8 @@ schedule_database_optimization(Descriptor) :-
     ),
     !,
     database_key_from_descriptor(Descriptor, DatabaseKey),
-    (   database_active_branch_count(DatabaseKey, _)
+    (   database_active_branch_count(DatabaseKey, Count),
+        Count > 0
     ->  with_mutex(commit_scheduler_mutex,
             (
                 (   (   pending_database_optimization(DatabaseKey, _)
@@ -397,6 +582,59 @@ schedule_database_optimization(Descriptor) :-
                 ;   true
                 ),
                 assertz(pending_global_optimization(DatabaseKey, Descriptor))
+            )
+        ),
+        wake_workers
+    ).
+
+% schedule_database_optimization_with_reply(+Descriptor, +ReplyRecord) is det.
+%
+% Like schedule_database_optimization/1, but also stores a reply record
+% (containing reply_queue and request_id) so that run_database_optimization
+% can send the result back to the caller. Used by the synchronous API
+% endpoint for non-branch descriptors.
+schedule_database_optimization_with_reply(Descriptor, ReplyRecord) :-
+    (   system_descriptor{} :< Descriptor
+    ;   database_descriptor{} :< Descriptor
+    ;   repository_descriptor{} :< Descriptor
+    ),
+    !,
+    database_key_from_descriptor(Descriptor, DatabaseKey),
+    (   database_active_branch_count(DatabaseKey, Count),
+        Count > 0
+    ->  with_mutex(commit_scheduler_mutex,
+            (
+                (   (   pending_database_optimization(DatabaseKey, _)
+                    ;   pending_database_optimization_due(DatabaseKey)
+                    )
+                ->  assertz(pending_database_optimization_due(DatabaseKey))
+                ;   true
+                ),
+                (   retract(pending_database_optimization(DatabaseKey, _))
+                ->  true
+                ;   true
+                ),
+                assertz(pending_database_optimization(DatabaseKey, Descriptor)),
+                retractall(pending_optimization_reply(DatabaseKey, _)),
+                assertz(pending_optimization_reply(DatabaseKey, ReplyRecord))
+            )
+        ),
+        wake_workers
+    ;   with_mutex(commit_scheduler_mutex,
+            (
+                (   (   pending_global_optimization(DatabaseKey, _)
+                    ;   pending_global_optimization_due(DatabaseKey)
+                    )
+                ->  assertz(pending_global_optimization_due(DatabaseKey))
+                ;   true
+                ),
+                (   retract(pending_global_optimization(DatabaseKey, _))
+                ->  true
+                ;   true
+                ),
+                assertz(pending_global_optimization(DatabaseKey, Descriptor)),
+                retractall(pending_optimization_reply(DatabaseKey, _)),
+                assertz(pending_optimization_reply(DatabaseKey, ReplyRecord))
             )
         ),
         wake_workers
@@ -457,20 +695,50 @@ run_branch_optimization(Descriptor) :-
 run_database_optimization(Descriptor) :-
     database_key_from_descriptor(Descriptor, DatabaseKey),
     catch(
-        with_meta_commit_lock(
-            DatabaseKey,
-            descriptor_optimize(Descriptor)
+        (   with_meta_commit_lock(
+                DatabaseKey,
+                descriptor_optimize(Descriptor)
+            ),
+            Result = optimize_success
         ),
         Error,
-        log_optimization_error(database, DatabaseKey, Error)
+        (   Result = error(Error),
+            log_optimization_error(database, DatabaseKey, Error)
+        )
+    ),
+    deliver_optimization_reply(DatabaseKey, Result).
+
+%% deliver_optimization_reply(+DatabaseKey, +Result) is det.
+%
+% If a reply record was registered for this DatabaseKey, send the result
+% back to the reply queue and clean up. Otherwise, this is a fire-and-forget
+% scheduled optimization with no caller waiting.
+deliver_optimization_reply(DatabaseKey, Result) :-
+    (   retract(pending_optimization_reply(DatabaseKey, ReplyRecord))
+    ->  (   get_dict(reply_queue, ReplyRecord, ReplyQueue),
+            get_dict(request_id, ReplyRecord, RequestId)
+        ->  catch(thread_send_message(ReplyQueue,
+                                      commit_result(Result, RequestId)),
+                  error(existence_error(message_queue, _), _),
+                  true)
+        ;   true
+        )
+    ;   true
     ).
 
 % try_global_optimization/0 is semidet.
 %
-% Called by idle commit workers. It atomically picks one pending global
-% optimization (and clears its due flag), runs it under the database meta lock,
+% Called by idle commit workers. It atomically picks one pending optimization
+% from either the global queue (pending_global_optimization) or the database
+% queue (pending_database_optimization), runs it under the database meta lock,
 % and removes the pending fact. Succeeds when a task was processed; fails when
-% the global queue is empty.
+% both queues are empty.
+%
+% The database queue was previously only drained by collect_pending_optimizations
+% (called from requeue_branch after commit processing). But when there are no
+% pending commits, requeue_branch is never called, and database optimizations
+% scheduled via schedule_database_optimization_with_reply would sit forever.
+% Now idle workers pick them up here.
 try_global_optimization :-
     with_mutex(commit_scheduler_mutex,
         (   (   pending_global_optimization_due(DatabaseKey)
@@ -481,7 +749,26 @@ try_global_optimization :-
             ->  Task = some(DatabaseKey, Descriptor)
             ;   Task = none
             )
-        ;   Task = none
+        ;   (   pending_database_optimization_due(DBKey2),
+                \+ pending_database_optimization(DBKey2, _)
+            ->  retractall(pending_database_optimization_due(DBKey2)),
+                Task = none
+            ;   pending_database_optimization(DBKey2, Descriptor2),
+                database_active_branch_count(DBKey2, ActiveCount),
+                ActiveCount > 0
+            ->  (   pending_database_optimization_due(DBKey2)
+                ->  true
+                ;   assertz(pending_database_optimization_due(DBKey2))
+                ),
+                Task = none
+            ;   pending_database_optimization(DBKey2, Descriptor2)
+            ->  retractall(pending_database_optimization_due(DBKey2)),
+                (   retract(pending_database_optimization(DBKey2, Descriptor2))
+                ->  Task = some(DBKey2, Descriptor2)
+                ;   Task = none
+                )
+            ;   Task = none
+            )
         )
     ),
     Task = some(DatabaseKey, Descriptor),
@@ -506,7 +793,21 @@ cleanup_active_branches_for_worker(WorkerId) :-
     with_mutex(commit_scheduler_mutex,
         findall(BranchKey, active_branch(BranchKey, WorkerId), Branches)),
     forall(member(BranchKey, Branches),
-           requeue_branch(BranchKey, WorkerId)).
+           requeue_branch(BranchKey, WorkerId)),
+    % A worker that dies mid-commit leaves its in-flight package unreplied;
+    % its producer would otherwise block forever on the infinite wait. The
+    % hook runs in the dying thread, so the thread-local is readable without
+    % a race. A duplicate (reply sent, death before the clear) lands on a
+    % consumed or destroyed queue and is ignored by deliver_commit_error.
+    (   nb_current(in_flight_package, Package),
+        Package \= none
+    ->  catch(get_dict(request_id, Package, RequestId), _, RequestId = unknown),
+        catch(deliver_commit_error(Package, worker_exited(WorkerId)), _, true),
+        nb_setval(in_flight_package, none),
+        json_log_error_formatted("Commit queue worker ~w exited with an undelivered commit result for request ~w",
+                                 [WorkerId, RequestId])
+    ;   true
+    ).
 
 try_commit_work :-
     thread_self(WorkerId),
@@ -532,10 +833,13 @@ process_one_commit(BranchKey, true) :-
     branch_commit_queue(BranchKey, Queue),
     thread_get_message(Queue, Package, [timeout(0)]),
     !,
-    catch(
-        run_queued_job(Package),
-        Error,
-        deliver_commit_error(Package, Error)
+    nb_setval(in_flight_package, Package),
+    (   catch(run_queued_job(Package), Error, deliver_commit_error(Package, Error))
+    ->  nb_setval(in_flight_package, none)
+    ;   % A queued job that fails without raising must still reply, or its
+        % producer blocks forever on the infinite wait.
+        deliver_commit_error(Package, commit_failed_without_error),
+        nb_setval(in_flight_package, none)
     ).
 process_one_commit(_, false).
 
@@ -544,11 +848,12 @@ process_commit_batch(BranchKey, Max, true) :-
     branch_commit_queue(BranchKey, Queue),
     thread_get_message(Queue, Package, [timeout(0)]),
     !,
-    catch(
-        run_queued_job(Package),
-        Error,
-        deliver_commit_error(Package, Error)
+    nb_setval(in_flight_package, Package),
+    (   catch(run_queued_job(Package), Error, deliver_commit_error(Package, Error))
+    ->  true
+    ;   deliver_commit_error(Package, commit_failed_without_error)
     ),
+    nb_setval(in_flight_package, none),
     Max1 is Max - 1,
     process_commit_batch(BranchKey, Max1, _).
 process_commit_batch(_, _, false).
@@ -611,10 +916,12 @@ deliver_commit_error(Package, Error) :-
 invalidate_pending_after_schema_change(BranchKey) :-
     branch_commit_queue(BranchKey, Queue),
     (   thread_get_message(Queue, Package, [timeout(0)])
-    ->  catch(thread_send_message(Package.reply_queue,
+    ->  nb_setval(in_flight_package, Package),
+        catch(thread_send_message(Package.reply_queue,
                                   commit_result(reject(schema_changed), Package.request_id)),
               error(existence_error(message_queue, _), _),
               true),
+        nb_setval(in_flight_package, none),
         invalidate_pending_after_schema_change(BranchKey)
     ;   true
     ).
@@ -751,8 +1058,8 @@ test(cleanup_active_branches_for_worker) :-
     assertion(\+ commit_queue:active_branch('b1', worker_1)),
     assertion(\+ commit_queue:active_branch('b2', worker_1)),
     assertion(commit_queue:active_branch('b3', worker_2)),
-    assertion(commit_queue:database_active_branch_count('b1', 0)),
-    assertion(commit_queue:database_active_branch_count('b2', 0)),
+    assertion(\+ commit_queue:database_active_branch_count('b1', _)),
+    assertion(\+ commit_queue:database_active_branch_count('b2', _)),
     assertion(commit_queue:database_active_branch_count('b3', 1)),
     with_mutex(commit_scheduler_mutex,
         (   retractall(commit_queue:pending_branches(_)),
@@ -775,7 +1082,7 @@ test(cleanup_active_branches_for_worker_requeues_pending_commits) :-
     assertz(commit_queue:database_active_branch_count(DBKey, 1)),
     cleanup_active_branches_for_worker(worker_1),
     assertion(\+ commit_queue:active_branch(BranchKey, worker_1)),
-    assertion(commit_queue:database_active_branch_count(DBKey, 0)),
+    assertion(\+ commit_queue:database_active_branch_count(DBKey, _)),
     assertion(commit_queue:pending_branches([BranchKey])),
     assertion(commit_queue:pending_branch_age(BranchKey, _)),
     with_mutex(commit_scheduler_mutex,
@@ -809,6 +1116,7 @@ test(requeue_branch_preserves_age_when_not_empty) :-
     commit_queue:pending_branch_age('age_b1', OriginalAge),
     thread_self(Self),
     assertz(commit_queue:active_branch('age_b1', Self)),
+    assertz(commit_queue:database_active_branch_count('age_b1', 1)),
     thread_send_message(Queue, dummy),
     requeue_branch('age_b1'),
     commit_queue:pending_branch_age('age_b1', NewAge),
@@ -862,7 +1170,7 @@ test(destroy_branch_queue_cleans_scheduler_state) :-
     assertion(\+ commit_queue:pending_branch_age(BranchKey, _)),
     assertion(\+ commit_queue:active_branch(BranchKey, _)),
     assertion(\+ commit_queue:pending_branches([BranchKey])),
-    assertion(commit_queue:database_active_branch_count(DBKey, 0)),
+    assertion(\+ commit_queue:database_active_branch_count(DBKey, _)),
     with_mutex(commit_scheduler_mutex,
         (   retractall(commit_queue:pending_branches(_)),
             retractall(commit_queue:active_branch(_, _)),
@@ -949,6 +1257,84 @@ test(process_one_commit_delivers_error, [setup(asserta(api_document:commit_packa
     thread_get_message(ReplyQueue, commit_result(error(test_error), req_2), [timeout(1)]),
     message_queue_destroy(ReplyQueue),
     destroy_branch_queue('test_process_error').
+
+% A queued job that fails without raising must still reply to its producer,
+% otherwise the producer blocks forever on its infinite wait.
+test(process_one_commit_delivers_error_when_job_fails, [setup(asserta(api_document:commit_package_test_handler(commit_queue:failing_commit_test_handler))), cleanup(retractall(api_document:commit_package_test_handler(_)))]) :-
+    cleanup_workers_and_branches,
+    destroy_branch_queue('test_process_fail'),
+    ensure_branch_queue('test_process_fail', Queue),
+    message_queue_create(ReplyQueue, []),
+    Package = commit_package{
+        branch_key: 'test_process_fail',
+        all_branches: ['test_process_fail'],
+        reply_queue: ReplyQueue,
+        request_id: req_fail
+    },
+    thread_send_message(Queue, Package),
+    process_one_commit('test_process_fail', true),
+    thread_get_message(ReplyQueue,
+                       commit_result(error(commit_failed_without_error), req_fail),
+                       [timeout(1)]),
+    message_queue_destroy(ReplyQueue),
+    destroy_branch_queue('test_process_fail').
+
+% A worker that dies mid-commit must not leave its producer blocked forever:
+% the worker-exit hook delivers an error for the package the worker had taken.
+test(worker_exit_hook_delivers_error_for_in_flight_package) :-
+    cleanup_workers_and_branches,
+    message_queue_create(ReplyQueue, []),
+    Package = commit_package{
+        branch_key: 'test_exit',
+        all_branches: ['test_exit'],
+        reply_queue: ReplyQueue,
+        request_id: req_exit
+    },
+    nb_setval(in_flight_package, Package),
+    % The exit hook logs the undelivered package as an error — expected
+    % noise for this test.
+    with_quiet_user_error(cleanup_active_branches_for_worker(worker_1)),
+    thread_get_message(ReplyQueue,
+                       commit_result(error(worker_exited(worker_1)), req_exit),
+                       [timeout(1)]),
+    nb_setval(in_flight_package, none),
+    message_queue_destroy(ReplyQueue).
+
+test(worker_exit_hook_delivers_nothing_without_in_flight_package) :-
+    cleanup_workers_and_branches,
+    message_queue_create(ReplyQueue, []),
+    nb_setval(in_flight_package, none),
+    cleanup_active_branches_for_worker(worker_2),
+    assertion(message_queue_property(ReplyQueue, size(0))),
+    message_queue_destroy(ReplyQueue).
+
+% thread_at_exit runs its goal in the dying thread, so thread-local
+% state survives to deliver the in-flight package's error.
+test(thread_death_flushes_in_flight_package) :-
+    cleanup_workers_and_branches,
+    message_queue_create(ReplyQueue, []),
+    Package = commit_package{
+        branch_key: 'test_death',
+        all_branches: ['test_death'],
+        reply_queue: ReplyQueue,
+        request_id: req_death
+    },
+    thread_create(
+        (   thread_self(Me),
+            % The exit hook logs the undelivered package as an error —
+            % expected noise for this test; it runs in the dying thread,
+            % so the silencer wraps the hook goal itself.
+            thread_at_exit(test_utils:with_quiet_user_error(
+                               commit_queue:cleanup_active_branches_for_worker(Me))),
+            nb_setval(in_flight_package, Package),
+            thread_exit(dead)
+        ),
+        ThreadId, []),
+    thread_join(ThreadId, _),
+    thread_get_message(ReplyQueue,
+                       commit_result(error(worker_exited(_)), req_death),
+                       [timeout(1)]),
+    message_queue_destroy(ReplyQueue).
 
 % Test that try_commit_work picks up an enqueued commit and delivers the
 % result to the reply queue, using the current thread as the worker.
@@ -1082,6 +1468,36 @@ test(wake_workers_wakes_idle_worker, [setup(setup_temp_store(State)), cleanup(te
     wake_workers,
     stop_workers.
 
+% Regression test: private tables created during commit work must not
+% survive on the worker thread. Tabled predicates keyed by layer blobs
+% (e.g. terminus_store:predicate_id/3) pin the Rust layer Arc for as long
+% as the table entry lives; without per-task cleanup the layer cache can
+% never observe the entry going dead.
+test(worker_abolishes_private_tables_after_commit,
+     [setup((setup_temp_store(State),
+             asserta(api_document:commit_package_test_handler(commit_queue:table_probe_handler)))),
+      cleanup((retractall(api_document:commit_package_test_handler(_)),
+               teardown_temp_store(State)))]) :-
+    cleanup_workers_and_branches,
+    destroy_branch_queue('test_tabrel'),
+    ensure_branch_queue('test_tabrel', _Queue),
+    message_queue_create(ReplyQueue, []),
+    start_workers(1),
+    multi_purpose_worker_thread(Worker),
+    Package = commit_package{
+        branch_key: 'test_tabrel',
+        all_branches: ['test_tabrel'],
+        reply_queue: ReplyQueue,
+        request_id: req_tabrel,
+        test_marker: true
+    },
+    enqueue_commit('test_tabrel', Package),
+    thread_get_message(ReplyQueue, commit_result(_, req_tabrel), [timeout(5)]),
+    assertion(worker_tables_drain(Worker)),
+    stop_workers,
+    message_queue_destroy(ReplyQueue),
+    destroy_branch_queue('test_tabrel').
+
 % Test that the SWI-Prolog thread communication primitives used by the
 % queue design continue to work: a thread can wait on its own message
 % queue and be woken by thread_send_message to its thread id.
@@ -1144,13 +1560,44 @@ test(active_branch_count_tracks_increments_and_decrements) :-
     assertion(commit_queue:database_active_branch_count(DBKey, 1)),
     decrement_database_active_branch_count("admin/db/local/branch/other", Count2),
     assertion(Count2 == 0),
-    assertion(commit_queue:database_active_branch_count(DBKey, 0)).
+    assertion(\+ commit_queue:database_active_branch_count(DBKey, _)).
 
 test(active_branch_count_negative_throws, [throws(error(active_branch_count_negative(DBKey), _))]) :-
     cleanup_active_branch_counts,
     organization_database_name(admin, db, DBKey),
     assertz(commit_queue:database_active_branch_count(DBKey, 0)),
     decrement_database_active_branch_count("admin/db/local/branch/main", _).
+
+test(active_branch_count_retracts_row_at_zero) :-
+    cleanup_active_branch_counts,
+    organization_database_name(admin, db, DBKey),
+    increment_database_active_branch_count("admin/db/local/branch/main"),
+    decrement_database_active_branch_count("admin/db/local/branch/main", Count),
+    assertion(Count == 0),
+    assertion(\+ commit_queue:database_active_branch_count(DBKey, _)).
+
+test(active_branch_count_decrement_without_increment_warns_and_stays_empty) :-
+    cleanup_active_branch_counts,
+    organization_database_name(admin, db2, DBKey),
+    test_utils:with_quiet_user_error(
+        commit_queue:decrement_database_active_branch_count("admin/db2/local/branch/main", Count)),
+    assertion(Count == 0),
+    assertion(\+ commit_queue:database_active_branch_count(DBKey, _)).
+
+test(database_active_count_retracts_row_at_zero) :-
+    cleanup_active_branch_counts,
+    organization_database_name(admin, db3, DBKey),
+    increment_database_active_count(DBKey),
+    decrement_database_active_count(DBKey),
+    assertion(\+ commit_queue:database_active_branch_count(DBKey, _)).
+
+test(post_delete_db_hook_clears_active_branch_count) :-
+    cleanup_active_branch_counts,
+    organization_database_name(admin, hookdb, DBKey),
+    assertz(commit_queue:database_active_branch_count(DBKey, 3)),
+    ignore(forall(plugins:post_delete_db_hook(admin, hookdb), true)),
+    assertion(\+ commit_queue:database_active_branch_count(DBKey, _)),
+    cleanup_active_branch_counts.
 
 test(schedule_database_optimization_records_pending_and_due) :-
     cleanup_optimization_state,
@@ -1232,6 +1679,7 @@ test(branch_optimization_runs_when_queue_empties) :-
     assertz(commit_queue:pending_branch_optimization('opt_branch', branch_descriptor{})),
     thread_self(Self),
     assertz(commit_queue:active_branch('opt_branch', Self)),
+    assertz(commit_queue:database_active_branch_count('opt_branch', 1)),
     requeue_branch('opt_branch'),
     assertion(commit_queue:called_optimization(branch, branch_descriptor{})),
     assertion(\+ commit_queue:pending_branch_optimization('opt_branch', _)),
@@ -1251,6 +1699,7 @@ test(second_branch_optimization_runs_as_soon_as_branch_drains) :-
     assertz(commit_queue:pending_branch_optimization_due('opt_branch2')),
     thread_self(Self),
     assertz(commit_queue:active_branch('opt_branch2', Self)),
+    assertz(commit_queue:database_active_branch_count('opt_branch2', 1)),
     requeue_branch('opt_branch2'),
     % The queue still has a message, so the branch is requeued and the
     % optimization must not run yet.
@@ -1271,6 +1720,91 @@ test(second_branch_optimization_runs_as_soon_as_branch_drains) :-
     cleanup_optimization_state,
     cleanup_workers_and_branches,
     destroy_branch_queue('opt_branch2').
+
+%%%%%%%%%%%%%%%%%%%% Branch registry expiry tests %%%%%%%%%%%%%%%%%%%%%%%%%
+
+backdate_branch_registry_touch(BranchKey, Seconds) :-
+    get_time(Now),
+    Past is Now - Seconds,
+    retractall(commit_queue:branch_registry_touch(BranchKey, _)),
+    assertz(commit_queue:branch_registry_touch(BranchKey, Past)).
+
+cleanup_branch_registry_entry(BranchKey) :-
+    destroy_branch_queue(BranchKey),
+    retractall(commit_queue:branch_registry_touch(BranchKey, _)).
+
+test(sweep_evicts_idle_empty_branch_queue) :-
+    cleanup_branch_registry_entry('sweep_b1'),
+    ensure_branch_queue('sweep_b1', _),
+    backdate_branch_registry_touch('sweep_b1', 10_000),
+    sweep_branch_registry,
+    assertion(\+ commit_queue:branch_commit_queue('sweep_b1', _)),
+    assertion(\+ commit_queue:branch_commit_lock('sweep_b1', _)),
+    assertion(\+ commit_queue:branch_registry_touch('sweep_b1', _)).
+
+test(sweep_keeps_branch_with_queued_work) :-
+    cleanup_branch_registry_entry('sweep_b2'),
+    ensure_branch_queue('sweep_b2', Queue),
+    thread_send_message(Queue, dummy),
+    backdate_branch_registry_touch('sweep_b2', 10_000),
+    sweep_branch_registry,
+    assertion(commit_queue:branch_commit_queue('sweep_b2', _)),
+    cleanup_branch_registry_entry('sweep_b2').
+
+test(sweep_keeps_active_branch_registry_entry) :-
+    cleanup_branch_registry_entry('sweep_b3'),
+    ensure_branch_queue('sweep_b3', _),
+    thread_self(Self),
+    assertz(commit_queue:active_branch('sweep_b3', Self)),
+    backdate_branch_registry_touch('sweep_b3', 10_000),
+    sweep_branch_registry,
+    assertion(commit_queue:branch_commit_queue('sweep_b3', _)),
+    retractall(commit_queue:active_branch('sweep_b3', _)),
+    cleanup_branch_registry_entry('sweep_b3').
+
+test(sweep_keeps_pending_branch_registry_entry) :-
+    cleanup_branch_registry_entry('sweep_b4'),
+    ensure_branch_queue('sweep_b4', _),
+    register_pending_branch('sweep_b4'),
+    backdate_branch_registry_touch('sweep_b4', 10_000),
+    sweep_branch_registry,
+    assertion(commit_queue:branch_commit_queue('sweep_b4', _)),
+    with_mutex(commit_scheduler_mutex,
+        (   retractall(commit_queue:pending_branches(_)),
+            retractall(commit_queue:pending_branch_age('sweep_b4', _))
+        )),
+    cleanup_branch_registry_entry('sweep_b4').
+
+test(sweep_keeps_fresh_branch_registry_entry) :-
+    cleanup_branch_registry_entry('sweep_b5'),
+    ensure_branch_queue('sweep_b5', _),
+    sweep_branch_registry,
+    assertion(commit_queue:branch_commit_queue('sweep_b5', _)),
+    cleanup_branch_registry_entry('sweep_b5').
+
+test(ensure_branch_queue_refreshes_touch) :-
+    cleanup_branch_registry_entry('sweep_b6'),
+    ensure_branch_queue('sweep_b6', _),
+    backdate_branch_registry_touch('sweep_b6', 10_000),
+    ensure_branch_queue('sweep_b6', _),
+    commit_queue:branch_registry_touch('sweep_b6', Touched),
+    get_time(Now),
+    assertion(Now - Touched < 60),
+    cleanup_branch_registry_entry('sweep_b6').
+
+test(post_delete_db_hook_destroys_branch_queues) :-
+    cleanup_branch_registry_entry('admin/deadq/local/branch/main'),
+    cleanup_branch_registry_entry('admin/deadq/local/branch/dev'),
+    cleanup_branch_registry_entry('other/keptq/local/branch/main'),
+    ensure_branch_queue('admin/deadq/local/branch/main', _),
+    ensure_branch_queue('admin/deadq/local/branch/dev', _),
+    ensure_branch_queue('other/keptq/local/branch/main', _),
+    ignore(forall(plugins:post_delete_db_hook(admin, deadq), true)),
+    assertion(\+ commit_queue:branch_commit_queue('admin/deadq/local/branch/main', _)),
+    assertion(\+ commit_queue:branch_commit_queue('admin/deadq/local/branch/dev', _)),
+    assertion(\+ commit_queue:branch_commit_lock('admin/deadq/local/branch/main', _)),
+    assertion(commit_queue:branch_commit_queue('other/keptq/local/branch/main', _)),
+    cleanup_branch_registry_entry('other/keptq/local/branch/main').
 
 :- end_tests(commit_queue).
 
@@ -1296,6 +1830,7 @@ cleanup_optimization_state :-
             retractall(commit_queue:pending_database_optimization_due(_)),
             retractall(commit_queue:pending_branch_optimization_due(_)),
             retractall(commit_queue:pending_global_optimization_due(_)),
+            retractall(commit_queue:pending_optimization_reply(_, _)),
             retractall(commit_queue:optimization_test_handler(_)),
             retractall(commit_queue:called_optimization(_, _))
         )).
@@ -1312,6 +1847,70 @@ success_handler(P, success(test_meta, [test_id])) :-
 
 error_handler(P, error(test_error)) :-
     get_dict(test_marker_error, P, true).
+
+failing_commit_test_handler(_, _) :-
+    fail.
+
+% Private-tabled probe used by worker_abolishes_private_tables_after_commit.
+% Calling it leaves a table entry on the calling thread, mimicking the
+% layer-keyed private tables (e.g. predicate_id/3) created by real commit work.
+:- table worker_table_probe/1 as private.
+worker_table_probe(marker).
+
+table_probe_handler(Package, Result) :-
+    get_dict(test_marker, Package, true),
+    worker_table_probe(_),
+    Result = success(test_meta, [test_id]).
+
+% worker_probe_table_count(+Worker, -Count) is det.
+%
+%  Asks Worker how many private table variants of worker_table_probe/1 it
+%  currently holds. Runs inside the worker via thread_signal/2 because
+%  private tables are only visible on their owning thread. Count is -1 if
+%  the worker does not answer in time.
+worker_probe_table_count(Worker, Count) :-
+    message_queue_create(ReportQueue, []),
+    catch(thread_signal(Worker,
+              (   findall(T,
+                          (   current_table(Head, T),
+                              worker_probe_head(Head)
+                          ),
+                          Tables),
+                  length(Tables, N),
+                  thread_send_message(ReportQueue, count(N))
+              )),
+          _SignalError,
+          true),
+    (   thread_get_message(ReportQueue, count(N0), [timeout(10)])
+    ->  Count = N0
+    ;   Count = -1
+    ),
+    catch(message_queue_destroy(ReportQueue), _, true).
+
+worker_probe_head(Head) :-
+    (   Head = _:Head1
+    ->  true
+    ;   Head1 = Head
+    ),
+    functor(Head1, worker_table_probe, 1).
+
+% worker_tables_drain(+Worker) is semidet.
+%
+%  Succeeds when the worker's worker_table_probe/1 table count reaches
+%  zero, giving the worker loop a bounded window to finish its per-task
+%  cleanup after the commit result has been delivered.
+worker_tables_drain(Worker) :-
+    worker_tables_drain(Worker, 40).
+worker_tables_drain(_Worker, 0) :-
+    !,
+    fail.
+worker_tables_drain(Worker, Tries) :-
+    (   worker_probe_table_count(Worker, 0)
+    ->  true
+    ;   sleep(0.05),
+        Tries1 is Tries - 1,
+        worker_tables_drain(Worker, Tries1)
+    ).
 
 test_receive_thread(Barrier, Expected) :-
     thread_self(Me),

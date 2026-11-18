@@ -31,11 +31,15 @@
               node_and_value_count/2,
               predicate_count/2,
               subject_id/3,
+              subject_with_prefix/3,
               predicate_id/3,
               object_id/3,
 
               id_triple/4,
               triple/4,
+
+              id_triple_count/5,
+              triple_count/5,
 
               id_triple_addition/4,
               triple_addition/4,
@@ -47,6 +51,11 @@
               id_triple_value_range_rev/6,
               triple_value_range/6,
               triple_value_range_rev/6,
+              id_triple_value_range_count/6,
+              triple_value_range_count/6,
+
+              id_triple_interval_relation/6,
+              triple_interval_relation/6,
 
               id_triple_sp_value_next/5,
               id_triple_sp_value_previous/5,
@@ -71,7 +80,9 @@
 
               pack_export/3,
               pack_layerids_and_parents/2,
-              pack_import/3,
+              pack_import/4,
+
+              create_empty_base_layer/2,
 
               count_layer_stack_size/2,
 
@@ -487,6 +498,22 @@ subject_id(Layer, Subject, Id) :-
 
 
 /*
+ * subject_with_prefix(+Layer, +Prefix, -Subject) is nondet
+ *
+ * Enumerate subject names that start with Prefix. Node names are stored in
+ * a sorted front-coded dictionary per layer band, so a prefix is a
+ * contiguous dictionary range which the store seeks with id() and streams
+ * until the prefix no longer matches — the wavelet-mapped subject ids are
+ * not steppable, so seeking has to happen per band in Rust.
+ *
+ * A name present in several bands is yielded once (sorted, deduplicated).
+ */
+subject_with_prefix(Layer, Prefix, Subject) :-
+    atom_string(Prefix, Prefix_String),
+    subject_with_prefix(Layer, Prefix_String, _Id, Subject).
+
+
+/*
  * predicate_id(+Layer, +Predicate, -Id) is semidet
  *
  * Get the ID from a predicate
@@ -602,6 +629,38 @@ triple(Layer, Subject, Predicate, Object) :-
     ->  true
     ;   object_id(Layer,Object, O_Id)).
 
+/**
+ * triple_count(+Layer, ?Subject, ?Predicate, ?Object, -Count) is det.
+ *
+ * Count the triples matching a partially bound pattern without
+ * enumerating them. Bound components resolve through the dictionaries;
+ * a bound component that does not resolve yields a count of 0.
+ */
+triple_count(Layer, Subject, Predicate, Object, Count) :-
+    (   (   nonvar(Subject)
+        ->  (   Subject = id(S_Id)
+            ->  true
+            ;   subject_id(Layer, Subject, S_Id)
+            )
+        ;   true),
+
+        (   nonvar(Predicate)
+        ->  (   Predicate = id(P_Id)
+            ->  true
+            ;   predicate_id(Layer, Predicate, P_Id)
+            )
+        ;   true),
+
+        (   nonvar(Object),
+            Object = id(O_Id)
+        ->  true
+        ;   ground(Object)
+        ->  object_id(Layer, Object, O_Id)
+        ;   true)
+    ->  id_triple_count(Layer, S_Id, P_Id, O_Id, Count)
+    ;   Count = 0
+    ).
+
 triple_addition(Layer, Subject, Predicate, Object) :-
     (   ground(Subject)
     ->  subject_id(Layer, Subject, S_Id)
@@ -689,6 +748,74 @@ triple_value_range_rev(Layer, Low, High, Subject, Predicate, Object) :-
     (   ground(Object)
     ->  true
     ;   object_id(Layer, Object, O_Id)).
+
+/**
+ * triple_interval_relation(+Layer, +Rel, +Reference, ?Subject, ?Predicate, ?Object) is nondet.
+ *
+ * Triples whose object value can satisfy the Allen relation Rel against
+ * Reference. The object ids come from the interval indexes and are a
+ * superset of the true hits — callers verify each object semantically.
+ */
+triple_interval_relation(Layer, Rel, Reference, Subject, Predicate, Object) :-
+    (   nonvar(Subject)
+    ->  (   Subject = id(S_Id)
+        ->  true
+        ;   subject_id(Layer, Subject, S_Id)
+        )
+    ;   true),
+
+    (   nonvar(Predicate)
+    ->  (   Predicate = id(P_Id)
+        ->  true
+        ;   predicate_id(Layer, Predicate, P_Id)
+        )
+    ;   true),
+
+    (   nonvar(Object),
+        Object = id(O_Id)
+    ->  true
+    ;   ground(Object)
+    ->  object_id(Layer, Object, O_Id)
+    ;   true),
+
+    id_triple_interval_relation(Layer, Rel, Reference, S_Id, P_Id, O_Id),
+
+    (   ground(Subject)
+    ->  true
+    ;   subject_id(Layer, Subject, S_Id)),
+
+    (   ground(Predicate)
+    ->  true
+    ;   predicate_id(Layer, Predicate, P_Id)),
+
+    (   ground(Object)
+    ->  true
+    ;   object_id(Layer, Object, O_Id)).
+
+/**
+ * triple_value_range_count(+Layer, +Low, +High, ?Subject, ?Predicate, -Count) is det.
+ *
+ * Count the triples whose object value falls in the half-open range
+ * [Low, High), optionally restricted by a subject and/or predicate,
+ * without enumerating them.
+ */
+triple_value_range_count(Layer, Low, High, Subject, Predicate, Count) :-
+    (   (   nonvar(Subject)
+        ->  (   Subject = id(S_Id)
+            ->  true
+            ;   subject_id(Layer, Subject, S_Id)
+            )
+        ;   true),
+
+        (   nonvar(Predicate)
+        ->  (   Predicate = id(P_Id)
+            ->  true
+            ;   predicate_id(Layer, Predicate, P_Id)
+            )
+        ;   true)
+    ->  id_triple_value_range_count(Layer, Low, High, S_Id, P_Id, Count)
+    ;   Count = 0
+    ).
 
 triple_value_next(Layer, Subject, Predicate, Reference, NextObject) :-
     (   Subject = id(S_Id) -> true
@@ -1061,6 +1188,46 @@ test(query_builder_for_committed, [cleanup(clean(TestDir)),setup(createng(TestDi
 
     builder_committed(Builder).
 
+test(subject_with_prefix,[cleanup(clean(TestDir)), setup(createng(TestDir))]) :-
+    open_archive_store(TestDir, Store),
+    open_write(Store, Builder),
+    forall(member(S, ["col/3","aaa/1","col/1","zzz/9","col/2","aab/1"]),
+           nb_add_triple(Builder, S, "Predicate", node("obj"))),
+    nb_add_triple(Builder, "col/4", "Predicate", value("x",'http://www.w3.org/2001/XMLSchema#string')),
+    nb_commit(Builder, Layer),
+    findall(N, subject_with_prefix(Layer, "col/", N), Names),
+    Names == ["col/1","col/2","col/3","col/4"].
+
+test(subject_with_prefix_no_match,[cleanup(clean(TestDir)), setup(createng(TestDir))]) :-
+    open_archive_store(TestDir, Store),
+    open_write(Store, Builder),
+    nb_add_triple(Builder, "aaa/1", "Predicate", node("obj")),
+    nb_commit(Builder, Layer),
+    \+ subject_with_prefix(Layer, "nope/", _).
+
+test(subject_with_prefix_shorter_than_first,[cleanup(clean(TestDir)), setup(createng(TestDir))]) :-
+    open_archive_store(TestDir, Store),
+    open_write(Store, Builder),
+    nb_add_triple(Builder, "abc/1", "Predicate", node("obj")),
+    nb_add_triple(Builder, "abd/2", "Predicate", node("obj")),
+    nb_commit(Builder, Layer),
+    findall(N, subject_with_prefix(Layer, "ab", N), Names),
+    Names == ["abc/1","abd/2"].
+
+test(subject_with_prefix_across_layers,[cleanup(clean(TestDir)), setup(createng(TestDir))]) :-
+    open_archive_store(TestDir, Store),
+    open_write(Store, Builder),
+    nb_add_triple(Builder, "col/2", "Predicate", node("obj")),
+    nb_add_triple(Builder, "zzz/1", "Predicate", node("obj")),
+    nb_commit(Builder, Layer),
+    open_write(Layer, Builder2),
+    nb_add_triple(Builder2, "col/1", "Predicate", node("obj")),
+    nb_add_triple(Builder2, "aaa/1", "Predicate", node("obj")),
+    nb_commit(Builder2, Layer2),
+    findall(N, subject_with_prefix(Layer2, "col/", N), Names),
+    sort(Names, Sorted),
+    Sorted == ["col/1","col/2"].
+
 test(squash_a_tower,[cleanup(clean(TestDir)), setup(createng(TestDir))]) :-
     open_archive_store(TestDir, Store),
     open_write(Store, Builder),
@@ -1412,6 +1579,79 @@ test(op_card,[cleanup(clean(TestDir)), setup(createng(TestDir))]) :-
     predicate_id(Layer, "B", B_Id),
     op_card(Layer, C_Id, B_Id, Count),
     Count = 2.
+
+test(triple_count,[cleanup(clean(TestDir)), setup(createng(TestDir))]) :-
+    open_archive_store(TestDir, Store),
+    open_write(Store, Builder),
+    nb_add_triple(Builder, "A", "B", node("C")),
+    nb_add_triple(Builder, "A", "B", node("D")),
+    nb_add_triple(Builder, "A", "E", node("F")),
+    nb_commit(Builder, Layer),
+    triple_count(Layer, "A", "B", node("C"), 1),
+    triple_count(Layer, "A", "B", node("G"), 0),
+    triple_count(Layer, "A", "B", _, 2),
+    triple_count(Layer, "A", _, _, 3),
+    triple_count(Layer, _, "B", _, 2),
+    triple_count(Layer, _, _, node("C"), 1),
+    triple_count(Layer, _, _, _, 3),
+    triple_count(Layer, "A", "no_such_predicate", _, 0),
+    triple_count(Layer, "no_such_subject", _, _, 0),
+    triple_count(Layer, "A", "B", node("no_such_object"), 0).
+
+test(triple_count_child_layer,[cleanup(clean(TestDir)), setup(createng(TestDir))]) :-
+    open_archive_store(TestDir, Store),
+    open_write(Store, Builder),
+    nb_add_triple(Builder, "A", "B", node("C")),
+    nb_add_triple(Builder, "A", "B", node("D")),
+    nb_add_triple(Builder, "A", "E", node("F")),
+    nb_commit(Builder, Layer),
+
+    open_write(Layer, Builder2),
+    nb_remove_triple(Builder2, "A", "B", node("C")),
+    nb_add_triple(Builder2, "G", "B", node("H")),
+    nb_commit(Builder2, Layer2),
+
+    triple_count(Layer2, "A", "B", _, 1),
+    triple_count(Layer2, "A", "B", node("C"), 0),
+    triple_count(Layer2, "A", _, _, 2),
+    triple_count(Layer2, _, "B", _, 2),
+    triple_count(Layer2, _, _, _, 3),
+
+    % removal then re-addition restores the count
+    open_write(Layer2, Builder3),
+    nb_add_triple(Builder3, "A", "B", node("C")),
+    nb_commit(Builder3, Layer3),
+    triple_count(Layer3, "A", "B", node("C"), 1),
+    triple_count(Layer3, _, _, _, 4).
+
+test(triple_value_range_count,[cleanup(clean(TestDir)), setup(createng(TestDir))]) :-
+    open_archive_store(TestDir, Store),
+    open_write(Store, Builder),
+    nb_add_triple(Builder, "doc1", "label", value("alpha",'http://www.w3.org/2001/XMLSchema#string')),
+    nb_add_triple(Builder, "doc2", "label", value("beta",'http://www.w3.org/2001/XMLSchema#string')),
+    nb_add_triple(Builder, "doc3", "label", value("gamma",'http://www.w3.org/2001/XMLSchema#string')),
+    nb_add_triple(Builder, "doc4", "label", value("delta",'http://www.w3.org/2001/XMLSchema#string')),
+    nb_add_triple(Builder, "doc1", "num", value(1,'http://www.w3.org/2001/XMLSchema#integer')),
+    nb_commit(Builder, Layer),
+
+    Low = value("beta",'http://www.w3.org/2001/XMLSchema#string'),
+    High = value("gamma",'http://www.w3.org/2001/XMLSchema#string'),
+
+    % [beta, gamma) covers beta and delta
+    triple_value_range_count(Layer, Low, High, _, _, 2),
+    triple_value_range_count(Layer, Low, High, "doc2", _, 1),
+    triple_value_range_count(Layer, Low, High, _, "label", 2),
+    triple_value_range_count(Layer, Low, High, "doc4", "label", 1),
+    triple_value_range_count(Layer, Low, High, "doc1", "label", 0),
+
+    % empty range
+    triple_value_range_count(Layer, Low, Low, _, _, 0),
+
+    % different datatype segment is unaffected
+    LowNum = value(0,'http://www.w3.org/2001/XMLSchema#integer'),
+    HighNum = value(10,'http://www.w3.org/2001/XMLSchema#integer'),
+    triple_value_range_count(Layer, LowNum, HighNum, _, _, 1),
+    triple_value_range_count(Layer, LowNum, HighNum, "doc1", "num", 1).
 
 setup_object_id_test_layer(TestDir, Layer) :-
     open_archive_store(TestDir, Store),

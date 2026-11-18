@@ -9,12 +9,34 @@ export TERMINUSDB_LOG_LEVEL=${TERMINUSDB_LOG_LEVEL:-DEBUG}
 export TERMINUSDB_LOG_FORMAT=${TERMINUSDB_LOG_FORMAT:-text}
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-PID_FILE="$SCRIPT_DIR/.terminusdb-test.pid"
-STORAGE_DIR="$SCRIPT_DIR/.terminusdb-test-storage"
-LOG_FILE="$SCRIPT_DIR/.terminusdb-test.log"
+
+# Use port-specific PID/storage/log files when a non-default port is set,
+# so multiple TerminusDB instances (e.g. 6363 and 7373) don't conflict.
+# Test storage goes on tmpfs where available — store fsyncs then hit RAM
+# instead of the repo checkout disk. /dev/shm is tmpfs on Linux; /tmp is a
+# plain disk fallback. TERMINUSDB_TEST_TMPDIR overrides for e.g. a
+# container --tmpfs mount.
+_TEST_TMPDIR="${TERMINUSDB_TEST_TMPDIR:-$( [ -d /dev/shm ] && echo /dev/shm || echo /tmp )}"
+# The storage dir name carries a hash of the checkout path: two clones on one
+# host share the tmpfs base but must not share — or wipe — each other's data.
+_CHECKOUT_ID="$(printf '%s' "$PROJECT_ROOT" | cksum | cut -d' ' -f1)"
+
+_TDB_PORT="${TERMINUSDB_SERVER_PORT:-6363}"
+if [ "$_TDB_PORT" = "6363" ]; then
+    PID_FILE="$SCRIPT_DIR/.terminusdb-test.pid"
+    STORAGE_DIR="$_TEST_TMPDIR/terminusdb-test-storage-${_CHECKOUT_ID}"
+    LOG_FILE="$SCRIPT_DIR/.terminusdb-test.log"
+else
+    PID_FILE="$SCRIPT_DIR/.terminusdb-test-${_TDB_PORT}.pid"
+    STORAGE_DIR="$_TEST_TMPDIR/terminusdb-test-storage-${_TDB_PORT}-${_CHECKOUT_ID}"
+    LOG_FILE="$SCRIPT_DIR/.terminusdb-test-${_TDB_PORT}.log"
+fi
 
 # Default admin password (terminusdb default)
 ADMIN_PASS="${TERMINUSDB_ADMIN_PASS:-root}"
+
+# Server port — overridable via TERMINUSDB_SERVER_PORT env var
+SERVER_PORT="${TERMINUSDB_SERVER_PORT:-6363}"
 
 function start_server() {
     local clean_storage=false
@@ -95,15 +117,52 @@ function start_server() {
     export TERMINUSDB_SERVER_NAME=127.0.0.1
     export TERMINUSDB_ADMIN_PASS="$ADMIN_PASS"
     export TERMINUSDB_SERVER_DB_PATH="$STORAGE_DIR"
-    # Load the appserver plugin (starts the Rust webserver) and the example
-    # webserver plugins. Do NOT enable auto-optimize here; that plugin runs
-    # optimization probabilistically after commits and breaks data-version tests.
+    # JWT is opt-in at runtime; enable it for the test server to preserve
+    # the prior compile-in behavior so jwt.js integration tests can run.
+    export TERMINUSDB_JWT_ENABLED=${TERMINUSDB_JWT_ENABLED:-true}
+    # Load the builtin plugins (always loaded — search stack, webserver
+    # plugins) plus any user plugins in plugins/. auto-optimize is a builtin
+    # plugin and runs by default in production, but the test server disables
+    # it: it optimises probabilistically after commits and can break
+    # data-version tests. Set TERMINUSDB_ENABLE_OPTIMIZER=1 to re-enable.
+    export TERMINUSDB_ENABLE_OPTIMIZER="${TERMINUSDB_ENABLE_OPTIMIZER:-0}"
     export TERMINUSDB_ADDON_PATH="$PROJECT_ROOT"
     export TERMINUSDB_PLUGINS_PATH="$PROJECT_ROOT/plugins"
+    export TERMINUSDB_BUILTIN_PLUGINS_PATH="$PROJECT_ROOT/builtin_plugins"
     # Single-port server: TERMINUSDB_SERVER_BACKEND selects the implementation
     # (swipl or rust). TERMINUSDB_SERVER_PORT sets the listen port (default 6363).
     export TERMINUSDB_SERVER_PORT=${TERMINUSDB_SERVER_PORT:-6363}
     export TERMINUSDB_SERVER_BACKEND=${TERMINUSDB_SERVER_BACKEND:-rust}
+
+    # tdb-search plugin: disabled by default. Set TERMINUSDB_INDEXER_BACKEND=http_tdb_search
+    # and TERMINUSDB_TDB_SEARCH_ENDPOINT=http://127.0.0.1:7372 to enable.
+    # For the embedded vectorlink engine use TERMINUSDB_INDEXER_BACKEND=vectorlink
+    # (requires TERMINUSDB_SERVER_BACKEND=rust); for a remote engine use
+    # http_vectorlink + TERMINUSDB_VECTORLINK_ENDPOINT.
+    export TERMINUSDB_INDEXER_BACKEND=${TERMINUSDB_INDEXER_BACKEND:-none}
+    # Embedded vectorlink backend: size the embedding cache for bulk ingestion.
+    # Millions of entries need gigabytes of disk in the data directory.
+    export VECTORLINK_EMBED_CACHE_SIZE=${VECTORLINK_EMBED_CACHE_SIZE:-3000000}
+    # Keep the embedded engine's Lance store inside the test storage dir
+    # (db_path is the storage root here, so the plugin's parent-dir
+    # convention would otherwise land it in tests/).
+    export VECTORLINK_DATA_DIR=${VECTORLINK_DATA_DIR:-$STORAGE_DIR/vectorlink}
+    # When the indexer backend is http_tdb_search, export the endpoint so
+    # the tdb_search plugin can find it via plugin_env/2. Without this,
+    # suggest/search/similar handlers fail with TdbSearchEndpointNotConfigured.
+    if [ "$TERMINUSDB_INDEXER_BACKEND" = "http_tdb_search" ]; then
+        export TERMINUSDB_TDB_SEARCH_ENDPOINT=${TERMINUSDB_TDB_SEARCH_ENDPOINT:-http://127.0.0.1:7372}
+    fi
+    export TERMINUSDB_SEARCH_ADMIN_USER=${TERMINUSDB_SEARCH_ADMIN_USER:-admin}
+    export TERMINUSDB_SEARCH_ADMIN_SECRET=${TERMINUSDB_SEARCH_ADMIN_SECRET:-root}
+
+    # Worker pool size: 30 for test workloads with concurrent streaming
+    # and indexing. Override with TERMINUSDB_WORKER_POOL_SIZE if needed.
+    export TERMINUSDB_WORKER_POOL_SIZE=${TERMINUSDB_WORKER_POOL_SIZE:-30}
+
+    # Commit queue timeout: prevent worker thread leakage when commit queue
+    # workers aren't running (e.g. optimize endpoint on branch descriptors).
+    export TERMINUSDB_COMMIT_QUEUE_TIMEOUT=${TERMINUSDB_COMMIT_QUEUE_TIMEOUT:-5}
 
     # Start the server in a new session so it survives the script exiting.
     python3 -c "
@@ -126,7 +185,7 @@ with open(pid_file, 'w') as f:
     
     # Wait for server to be ready
     echo -n "Waiting for server to be ready"
-    local max_wait=5
+    local max_wait=10
     local waited=0
     while [ $waited -lt $max_wait ]; do
         # Check both if process is running and if API responds

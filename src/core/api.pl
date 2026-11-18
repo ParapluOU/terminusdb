@@ -68,6 +68,10 @@
               api_class_frame/6,
               api_filled_frame/5,
 
+              % api_jsonschema.pl
+              tdb_class_to_json_schema/3,
+              api_class_jsonschema/5,
+
               % api_woql.pl
               woql_query_json/9,
               woql_query_streaming_json/5,
@@ -97,6 +101,7 @@
               list_existing_databases/4,
               pretty_print_databases/1,
               db_exists_api/4,
+              system_database_serve_ready/0,
 
               % api_error.pl
               api_error_jsonld/3,
@@ -130,6 +135,10 @@
 
               % api_document.pl
               api_can_read_document/6,
+              api_check_documents/11,
+              api_check_insert_body/4,
+              api_check_replace_body/4,
+              api_check_delete_body/3,
               api_insert_documents/9,
               api_delete_documents/9,
               api_delete_documents_by_type/8,
@@ -149,6 +158,7 @@
               convert_input_to_json_stream/4,
               document_stream_headers/3,
               document_stream_start/3,
+              document_stream_preamble/3,
               document_stream_write/4,
               document_stream_end/2,
 
@@ -202,7 +212,7 @@
               api_db_update/6,
 
               % api_graphql.pl
-              handle_graphql_request/10,
+              handle_graphql_request/11,
 
               % api_history.pl
               api_document_history/6,
@@ -216,7 +226,10 @@
               api_concat/6,
 
               % api_indexer
-              api_index_jobs/8
+              api_index_jobs/8,
+
+              % api_changes.pl
+              api_changes/5
           ]).
 
 :- use_module(api/api_init).
@@ -234,6 +247,7 @@
 :- use_module(api/graph_load).
 :- use_module(api/graph_dump).
 :- use_module(api/api_frame).
+:- use_module(api/api_jsonschema).
 :- use_module(api/api_woql).
 :- use_module(api/api_squash).
 :- use_module(api/api_reset).
@@ -256,4 +270,9 @@
 :- use_module(api/api_history).
 :- use_module(api/api_migration).
 :- use_module(api/api_indexer).
+:- use_module(api/api_search).
 :- use_module(api/api_merge).
+:- use_module(api/api_changes).
+
+% Loads the write-gate audit suites; no exports needed.
+:- use_module(api/api_write_gates_test, []).

@@ -7,6 +7,7 @@
 
 :- use_module(library(option)).
 :- use_module(library(lists)).
+:- use_module(library(utf8)).
 :- use_module(library(plunit)).
 
 /** <module> Fast JSON Parser using Rust
@@ -66,7 +67,9 @@ json_read_dict(Stream, Dict, Options) :-
 json_read_dict_stream(Stream, Dict, Options) :-
     % Use Rust parser for one-at-a-time streaming
     % All streams are now string streams (buffered from HTTP)
-    (   catch('$json_preserve':json_read_one_from_stream(Stream, Value), _Error, fail)
+    % Parse errors must propagate — mapping them to eof would silently
+    % truncate multi-document streams and drop the remaining documents.
+    (   '$json_preserve':json_read_one_from_stream(Stream, Value)
     ->  (   Value = eof
         ->  Dict = eof
         ;   % The streaming parser may leave array tails as variables.
@@ -189,16 +192,16 @@ test(integer_values) :-
 test(float_values) :-
     JSON = '{"x": 3.14, "y": -2.5, "z": 0.0}',
     json_read_dict(JSON, DictRust, []),
-    % Rust parser converts decimals to rationals for precision
+    % Decimals arrive as NrD^^xsd:decimal - exact rationals carrying
+    % the decimal type tag for the inference ladder.
     get_dict(x, DictRust, X),
     get_dict(y, DictRust, Y),
     get_dict(z, DictRust, Z),
-    % Decimals become rationals
-    assertion(rational(X)),
-    assertion(rational(Y)),
-    % 0.0 becomes integer 0
-    assertion(integer(Z)),
-    assertion(Z == 0).
+    assertion(X = XVal^^'http://www.w3.org/2001/XMLSchema#decimal'),
+    assertion(rational(XVal)),
+    assertion(Y = _^^'http://www.w3.org/2001/XMLSchema#decimal'),
+    % 0.0 keeps an integer value under the decimal tag
+    assertion(Z = 0^^'http://www.w3.org/2001/XMLSchema#decimal').
 
 test(large_integer) :-
     JSON = '{"big": 9007199254740991}',
@@ -249,9 +252,10 @@ test(scientific_notation) :-
     json_read_dict(JSON, DictRust, []),
     get_dict(sci, DictRust, Sci),
     get_dict(neg, DictRust, Neg),
-    % Scientific notation produces rationals after expansion
-    assertion((rational(Sci) ; float(Sci))),
-    assertion((rational(Neg) ; float(Neg))).
+    % Scientific notation: serde's Display may expand 1.23e10 to
+    % 12300000000.0, which then takes the NrD^^xsd:decimal path
+    assertion(once((rational(Sci) ; float(Sci) ; Sci = _^^_))),
+    assertion(once((rational(Neg) ; float(Neg) ; Neg = _^^_))).
 
 test(dict_tag) :-
     JSON = '{"test": 1}',
@@ -345,11 +349,12 @@ test(mixed_types_in_nested_arrays) :-
     assertion(integer(Item0Rust.value)),
     nth0(1, ItemsRust, Item1Rust),
     nth0(1, ItemsStd, Item1Std),
-    % Rust converts 2.5 to rational 5r2
-    assertion(rational(Item1Rust.value)),
+    % Rust converts 2.5 to rational 5r2 tagged as xsd:decimal
+    assertion(Item1Rust.value = V1^^'http://www.w3.org/2001/XMLSchema#decimal'),
+    assertion(rational(V1)),
     assertion(float(Item1Std.value)),
     % Verify they're numerically equal
-    assertion(Item1Rust.value =:= Item1Std.value),
+    assertion(V1 =:= Item1Std.value),
     nth0(2, ItemsRust, Item2Rust),
     nth0(2, ItemsStd, Item2Std),
     assertion(Item2Rust.value == Item2Std.value),
@@ -414,6 +419,35 @@ test(stream_eof_after_read) :-
     Dict2 == eof,
     close(Stream).
 
+% Test UTF-8 content via the octet-byte string-stream convention used by
+% the HTTP layer (input_encoding(octet) into a string, then open_string):
+% each code point is one raw byte, so multi-byte UTF-8 survives intact.
+test(stream_utf8_bytes) :-
+    atom_codes('{"name":"Umeå","city":"São Paulo"}', Chars),
+    phrase(utf8_codes(Chars), Bytes),
+    string_codes(Byte_String, Bytes),
+    open_string(Byte_String, Stream),
+    json_read_dict(Stream, Dict, [end_of_file(eof)]),
+    Dict.name == "Umeå",
+    Dict.city == "São Paulo",
+    close(Stream).
+
+% Test that a parse error is raised, not silently reported as eof.
+% Returning eof here truncates multi-document streams mid-flight and
+% silently drops the remaining documents.
+test(stream_parse_error_not_eof, [error(json_parse_error(_,_,_), _)]) :-
+    open_string('{bad json', Stream),
+    json_read_dict(Stream, _Dict, [end_of_file(eof)]),
+    close(Stream).
+
+% Test non-UTF-8 bytes raise rather than silently return eof — a lone
+% latin-1 byte is what a decoded-character string stream would emit.
+test(stream_invalid_utf8_not_eof, [error(json_parse_error(_,_,_), _)]) :-
+    string_codes(Byte_String, [0x7B, 0x22, 0x6E, 0x22, 0x3A, 0x22, 0xE5, 0x22, 0x7D]),
+    open_string(Byte_String, Stream),
+    json_read_dict(Stream, _Dict, [end_of_file(eof)]),
+    close(Stream).
+
 % Test array with nested objects
 test(nested_array) :-
     JSON = '[{"@id":"A","val":1},{"@id":"B","val":2}]',
@@ -448,9 +482,11 @@ test(large_integers) :-
 test(float_values) :-
     JSON = '{"pi":3.14159,"e":2.71828}',
     json_read_dict(JSON, Dict, []),
-    % Rust parser converts decimals to rationals for precision
-    rational(Dict.pi),
-    rational(Dict.e).
+    % Decimals arrive as NrD^^xsd:decimal - exact rationals
+    Dict.pi = Pi^^'http://www.w3.org/2001/XMLSchema#decimal',
+    rational(Pi),
+    Dict.e = E^^'http://www.w3.org/2001/XMLSchema#decimal',
+    rational(E).
 
 % Test boolean and null
 test(special_values) :-
