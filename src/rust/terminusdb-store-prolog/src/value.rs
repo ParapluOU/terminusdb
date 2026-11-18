@@ -274,6 +274,9 @@ pub fn make_entry_from_term<C: QueryableContextType>(
         Ok(HexBinary::make_entry(&HexBinary(
             hex::decode(hexstring).unwrap(),
         )))
+    } else if atom!("https://xbrl.org/2021SQName") == ty {
+        let inner_string: PrologText = inner_term.get_ex()?;
+        Ok(SQName::make_entry(&inner_string.into_inner()))
     } else if atom!("http://terminusdb.com/schema/xdd#dateTimeInterval") == ty {
         // Serialize compound term to string and parse in Rust,
         // because swipl-rs get_arg cannot extract compound sub-terms.
@@ -400,6 +403,13 @@ pub fn unify_entry<C: QueryableContextType>(
             let val = entry.as_val::<AnyURI, AnyURI>();
             object_term.unify_arg(1, val.as_ref())?;
             object_term.unify_arg(2, atom!("http://www.w3.org/2001/XMLSchema#anyURI"))
+        }
+        Datatype::SQName => {
+            // tdb-succinct 0.2.1 added xsd:SQName (XBRL's qualified name with
+            // its namespace spelled out). Same IRI 12.1.0-rc3 uses.
+            let val = entry.as_val::<SQName, String>();
+            object_term.unify_arg(1, val)?;
+            object_term.unify_arg(2, atom!("https://xbrl.org/2021SQName"))
         }
         Datatype::AnySimpleType => {
             let anysimpletype = entry.as_val::<AnySimpleType, String>();
@@ -870,6 +880,11 @@ fn parse_interval_term(s: &str) -> Result<TypedDictEntry, String> {
         end_type,
         flag,
         duration,
+        // tdb-succinct 0.2.1 appended the client-supplied UTC offsets (minutes)
+        // to the interval encoding. This boundary's Prolog term carries no
+        // timezone, so both ends are UTC — the tz-less reading this had before.
+        start_tz: 0,
+        end_tz: 0,
     }))
 }
 

@@ -7,10 +7,22 @@ debug = true
 
 [patch.crates-io]
 #tdb-succinct = {path="../../../tdb-succinct"}
-tdb-succinct = {git="https://github.com/terminusdb-org/tdb-succinct", branch="xbrl-json-iso-intervals"}
+# v0.2.1, what TerminusDB 12.1.0-rc3 pins and what the patched terminus-store
+# fork now requires. The 0.2 line is not on crates.io, so this patch is what
+# makes every `tdb-succinct = "0.2"` requirement in the graph resolve.
+tdb-succinct = {git="https://github.com/terminusdb-org/tdb-succinct", tag="v0.2.1"}
 #terminus-store = {path="../../../terminusdb-store"}
 #terminus-store = {git="https://github.com/terminusdb-org/terminusdb-store"}
-# Path-pinned to the ParapluOU Proof-of-WOQL store fork (branch parture-proof-of-woql).
-terminus-store = {path="../../../terminusdb-store-paraplu"}
+# The ParapluOU Proof-of-WOQL store fork. A git dependency, not the sibling
+# path this used to be: a `../../../terminusdb-store-paraplu` path makes this
+# workspace buildable only for someone who has that checkout beside it, and —
+# because terminusdb-query-proof also pulls terminusdb-woql-proof, which
+# depends on the same fork over git — a path here resolves to a SECOND copy of
+# terminus-store, so a LayerCommitment from one is a different type to the
+# other and the proof traits no longer unify. The spec below must stay
+# character-identical to woql-proof's own (same URL, same branch) for cargo to
+# treat them as one source. Local store edits therefore have to be pushed to
+# that branch before this server picks them up.
+terminus-store = {git="https://github.com/ParapluOU/terminusdb-store", branch="parture-proof-of-woql"}
 swipl = {git="https://github.com/terminusdb-org/swipl-rs"}
 #swipl = {path="../../../swipl-rs/swipl"}

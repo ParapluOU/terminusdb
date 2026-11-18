@@ -19,4 +19,4 @@ thiserror = "2"
 
 [dev-dependencies]
 tempfile = "3"
-tdb-succinct = "0.1.2"
+tdb-succinct = "0.2"

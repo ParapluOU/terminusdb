@@ -1084,8 +1084,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "dory-derive"
+version = "0.3.0"
+source = "git+https://github.com/ParapluOU/dory?branch=main#36d00ea888d73123c23c014e6ad5605036dd7f7d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
 name = "dory-pcs"
 version = "0.4.2"
+dependencies = [
+ "ark-bn254",
+ "ark-ec",
+ "ark-ff",
+ "ark-serialize",
+ "ark-std",
+ "bincode",
+ "blake2",
+ "digest 0.10.7",
+ "dory-derive 0.3.0",
+ "rand_core 0.6.4",
+ "serde",
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
+name = "dory-pcs"
+version = "0.4.2"
+source = "git+https://github.com/ParapluOU/dory?branch=main#36d00ea888d73123c23c014e6ad5605036dd7f7d"
 dependencies = [
  "ark-bn254",
  "ark-ec",
@@ -1097,7 +1127,7 @@ dependencies = [
  "blitzar",
  "blitzar-sys",
  "digest 0.10.7",
- "dory-derive",
+ "dory-derive 0.3.0 (git+https://github.com/ParapluOU/dory?branch=main)",
  "rand_core 0.6.4",
  "rayon",
  "serde",
@@ -3808,9 +3838,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tdb-datetime"
+version = "0.1.0"
+source = "git+https://github.com/terminusdb-org/tdb-succinct?tag=v0.2.1#3e57cc19323e0e294d407c227b7bd0f3e80dc9fb"
+
+[[package]]
 name = "tdb-succinct"
-version = "0.1.4"
-source = "git+https://github.com/terminusdb-org/tdb-succinct?branch=xbrl-json-iso-intervals#ec1519923e44e73cad17264f21534065855be6e0"
+version = "0.2.1"
+source = "git+https://github.com/terminusdb-org/tdb-succinct?tag=v0.2.1#3e57cc19323e0e294d407c227b7bd0f3e80dc9fb"
 dependencies = [
  "async-trait",
  "base64 0.21.7",
@@ -3826,6 +3861,7 @@ dependencies = [
  "num-traits",
  "regex",
  "rug",
+ "tdb-datetime",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util 0.7.18",
@@ -3847,6 +3883,7 @@ dependencies = [
 [[package]]
 name = "terminus-store"
 version = "0.21.8"
+source = "git+https://github.com/ParapluOU/terminusdb-store?branch=parture-proof-of-woql#1ce879ea5fe07bbd448ab52938bece67394dafb6"
 dependencies = [
  "ark-bn254",
  "ark-ec",
@@ -3860,7 +3897,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "chrono",
- "dory-pcs",
+ "dory-pcs 0.4.2 (git+https://github.com/ParapluOU/dory?branch=main)",
  "flate2",
  "fs2",
  "futures",
@@ -4040,7 +4077,7 @@ dependencies = [
  "base64 0.13.1",
  "chardetng",
  "chrono",
- "dory-pcs",
+ "dory-pcs 0.4.2",
  "encoding_rs",
  "hex",
  "rug",
@@ -4084,7 +4121,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "decimal-rs",
- "dory-pcs",
+ "dory-pcs 0.4.2 (git+https://github.com/ParapluOU/dory?branch=main)",
  "hex",
  "num-bigint",
  "num-integer",
