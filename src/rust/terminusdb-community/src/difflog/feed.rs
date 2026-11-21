@@ -303,6 +303,40 @@ impl Feed {
         })
     }
 
+    /// Bring a branch's index up to date now, rather than on the next read.
+    ///
+    /// This is what the commit hook calls. It does exactly what the first
+    /// field of a poll would have done, so a warmed branch and an unwarmed one
+    /// differ only in who paid for the walk — which is why losing a warm-up
+    /// costs nothing but latency.
+    pub fn warm(&self, key: &BranchKey) -> io::Result<usize> {
+        let log = self.log_for(key);
+        let mut log = ignore_poison(log.lock());
+        self.refresh(key, &mut log)?;
+        Ok(log.entries.len())
+    }
+
+    /// Warm, and report whether `commit` actually landed in the index.
+    ///
+    /// A commit hook fires from inside the transaction that produced it, so at
+    /// that moment the branch head may not yet be visible to a separate
+    /// reader: a warm-up triggered by commit N can legitimately see only up to
+    /// N-1. Returning false lets the caller decline to advance a watermark it
+    /// has not actually caught up to, which is the difference between a
+    /// watermark and a guess.
+    pub fn warm_through(&self, key: &BranchKey, commit: &str) -> io::Result<bool> {
+        let log = self.log_for(key);
+        let mut log = ignore_poison(log.lock());
+        self.refresh(key, &mut log)?;
+        Ok(log.entries.iter().any(|entry| entry.commit == commit))
+    }
+
+    /// Pre-render a layer's delta into the cache, so the first consumer to ask
+    /// for payloads does not pay for resolution.
+    pub fn warm_delta(&self, layer_id: &str) -> io::Result<()> {
+        self.delta_for(layer_id).map(|_| ())
+    }
+
     /// Branch names of a database, for a consumer discovering what to follow.
     pub fn branches(&self, org: &str, db: &str) -> io::Result<Vec<String>> {
         const REF_BRANCH_BASE: &str = "terminusdb://ref/data/Branch/";

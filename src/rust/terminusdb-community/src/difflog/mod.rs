@@ -51,6 +51,12 @@ const DEFAULT_MAX_LOGS: usize = 1024;
 /// to produce and the cheap thing to re-produce, which is what a cache is for.
 const DEFAULT_MAX_DELTAS: usize = 256;
 
+/// How many times a warm-up looks for the commit it was told about, and how
+/// long it waits between tries. Short: the transaction is finishing as this
+/// runs, and a miss is self-correcting.
+const WARM_ATTEMPTS: usize = 5;
+const WARM_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// Everything the routes need once a store is attached: the log index and the
 /// authorizer, which read the same store.
 pub struct Attached {
@@ -124,9 +130,68 @@ predicates! {
     }
 }
 
-/// Register the feed: its Prolog handshake predicate, and its routes with the
-/// webserver.
+/// The diff log as a consumer of commits.
+///
+/// Warming is strictly optional: `Feed::poll` refreshes the index itself, so a
+/// dropped event, a failed warm-up or a restart costs the next reader one
+/// chain walk and nothing more. That is what lets this hook be best-effort.
+struct DiffLogHook;
+
+impl terminusdb_webserver::commit_hooks::CommitHook for DiffLogHook {
+    fn name(&self) -> &'static str {
+        "difflog"
+    }
+
+    fn on_commit(
+        &self,
+        event: &terminusdb_webserver::commit_hooks::CommitEvent,
+    ) -> Result<(), String> {
+        let FeedState::Attached(feed, _) = feed_handle() else {
+            // No store yet: nothing to warm, and the next read will do it.
+            return Ok(());
+        };
+        let key = feed::BranchKey {
+            org: event.organization.clone(),
+            db: event.database.clone(),
+            branch: event.branch.clone(),
+        };
+        // Pre-render this commit's own delta first: the layer exists as soon
+        // as it is written, independently of the branch head moving, and it is
+        // the delta a consumer following the log is about to ask for.
+        if let Some(layer) = event.instance_layer.as_deref() {
+            feed.warm_delta(layer).map_err(|error| error.to_string())?;
+        }
+
+        // The event arrives from inside the transaction that produced it, so
+        // the branch head can still be invisible to us for a moment. Give it
+        // a few brief tries rather than reporting a watermark we have not
+        // reached — this is a worker thread, so waiting here costs the commit
+        // path nothing.
+        for attempt in 0..WARM_ATTEMPTS {
+            if attempt > 0 {
+                std::thread::sleep(WARM_RETRY_DELAY);
+            }
+            if feed
+                .warm_through(&key, &event.commit_id)
+                .map_err(|error| error.to_string())?
+            {
+                return Ok(());
+            }
+        }
+        // Still not visible. The index is warm up to the previous commit and
+        // a reader will pick this one up itself, so the only thing that must
+        // not happen is the watermark advancing past it.
+        Err(format!(
+            "commit {} is not visible to the feed yet",
+            event.commit_id
+        ))
+    }
+}
+
+/// Register the feed: its Prolog handshake predicate, its routes with the
+/// webserver, and its interest in commits.
 pub fn register() {
     register_difflog_attach_store();
     terminusdb_webserver::server::register_router(route::router());
+    terminusdb_webserver::commit_hooks::register_hook(Arc::new(DiffLogHook));
 }

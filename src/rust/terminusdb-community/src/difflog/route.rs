@@ -248,6 +248,10 @@ async fn status(headers: HeaderMap) -> Response {
                 // What this process is holding: cache occupancy, not anything
                 // about a particular database's contents.
                 "indexed": indexed,
+                // Whether commits are reaching the warm-up hooks at all. Built
+                // and then not surfaced, which made a dead hook invisible:
+                // "indexed" being empty says the index is cold but not why.
+                "hooks": terminusdb_webserver::commit_hooks::stats(),
             })),
         )
             .into_response(),
