@@ -79,10 +79,40 @@ async fn method_not_allowed_middleware(req: Request, next: Next) -> Response {
     }
 }
 
+/// Routers registered by other crates in this workspace before the listener is
+/// bound.
+///
+/// The webserver deliberately does not depend on the crates that extend it —
+/// `terminusdb-community` depends on *this* crate, not the other way round —
+/// so a native route it wants served reaches the router through here rather
+/// than through a module reference. Registration happens during dylib load,
+/// which is always before `start_with_routes`.
+static EXTRA_ROUTERS: std::sync::Mutex<Vec<Router>> = std::sync::Mutex::new(Vec::new());
+
+/// Add a router to be merged into the application.
+///
+/// Call before the server starts; a router registered afterwards is never
+/// served, and saying so here is cheaper than a silent 404 later.
+pub fn register_router(router: Router) {
+    EXTRA_ROUTERS
+        .lock()
+        .expect("extra router registry poisoned")
+        .push(router);
+}
+
+fn take_extra_routers() -> Vec<Router> {
+    std::mem::take(
+        &mut *EXTRA_ROUTERS
+            .lock()
+            .expect("extra router registry poisoned"),
+    )
+}
+
 /// Build the Axum application router.
 ///
 /// Exposes a root redirect and health-check endpoint. Additional routes are
-/// registered by Prolog plugins through the webserver hooks.
+/// registered by Prolog plugins through the webserver hooks, and by other
+/// crates through [`register_router`].
 pub fn app() -> Router {
     Router::new()
         .route("/", get(root_redirect))
@@ -247,7 +277,11 @@ pub fn start_with_routes(
             let plugin_router = crate::dispatch::build_plugin_router(plugin_routes);
             let static_router = crate::dispatch::build_static_router(plugin_static_paths);
             let stream_router = crate::dispatch::build_stream_router(plugin_streams);
-            let app = app()
+            let mut app = app();
+            for extra in take_extra_routers() {
+                app = app.merge(extra);
+            }
+            let app = app
                 .merge(plugin_router)
                 .merge(static_router)
                 .merge(stream_router)
