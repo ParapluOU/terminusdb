@@ -323,6 +323,35 @@ mod tests {
     };
     use tower::ServiceExt;
 
+    /// The Prolog subscription plugin registers `/api/graphql/{*path}`, and the
+    /// webserver merges plugin routes into the same router as everything
+    /// registered through `register_router`. matchit refuses a catch-all
+    /// beside a *parameter* route at the same position — and the failure is a
+    /// panic at startup, so the server does not come up at all. Any route a
+    /// crate adds under `/api/graphql/` therefore has to lead with a static
+    /// segment; this pins that so it is caught here rather than by a dead
+    /// server.
+    #[test]
+    fn a_route_under_the_graphql_prefix_must_lead_with_a_static_segment() {
+        let plugin = || Router::new().route("/api/graphql/{*path}", get(|| async { "" }));
+
+        let ok = Router::new()
+            .route("/api/graphql/_difflog/{org}/{db}", get(|| async { "" }))
+            .merge(plugin());
+        drop(ok);
+
+        let conflicts = std::panic::catch_unwind(|| {
+            Router::<()>::new()
+                .route("/api/graphql/{org}/{db}/local/_x", get(|| async { "" }))
+                .merge(plugin())
+        });
+        assert!(
+            conflicts.is_err(),
+            "a parameter route under /api/graphql/ must still conflict; if this \
+             starts passing, matchit changed and the prefix form is no longer forced"
+        );
+    }
+
     #[tokio::test]
     async fn health_returns_ok() {
         let app = app();

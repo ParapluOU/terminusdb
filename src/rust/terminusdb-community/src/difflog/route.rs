@@ -1,12 +1,26 @@
 //! The feed's HTTP surface, served by the Rust webserver.
 //!
-//! Three routes, none of which goes through Prolog:
+//! The feed is another graph in the existing GraphQL family, not a second API:
 //!
-//! - `POST /api/v1/feed/graphql` — a GraphQL request, the normal way in.
-//! - `GET  /api/v1/feed/graphql?query=…` — the same, for a consumer (or a
-//!   `curl`) that would rather not POST.
-//! - `GET  /api/v1/feed/status` — whether the feed is attached, and what its
-//!   indexes currently hold.
+//! - `POST|GET /api/graphql/_difflog/{org}/{db}` — the log of that database,
+//!   in the same URL family as `_commits` and `_meta`, so a client has one
+//!   data surface. The database comes from the path, so the `database`
+//!   argument is optional here.
+//! - `GET /api/v1/feed/status` — operational, not data: whether a store is
+//!   attached, what the indexes hold, and whether commits are reaching the
+//!   warm-up hooks.
+//!
+//! ## Why the graph selector is a prefix here and a suffix everywhere else
+//!
+//! TerminusDB names its other GraphQL views by suffix —
+//! `/api/graphql/<org>/<db>/local/_commits`. This one cannot: the Prolog
+//! subscription plugin registers `/api/graphql/{*path}`, everything lands in
+//! one router, and matchit refuses a catch-all beside a *parameter* route at
+//! the same position. `/api/graphql/{org}/{db}/local/_difflog` does not fail
+//! over to the plugin — it panics the router and the server never binds. A
+//! static segment first is allowed, so the selector leads. Pinned by
+//! `server::tests::a_route_under_the_graphql_prefix_must_lead_with_a_static_segment`,
+//! which fails if that constraint ever relaxes.
 //!
 //! ## Authorization
 //!
@@ -33,7 +47,7 @@
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::Query as AxumQuery;
+use axum::extract::{Path as AxumPath, Query as AxumQuery};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -49,7 +63,10 @@ use super::{feed_handle, FeedState};
 /// Routes to merge into the webserver's router.
 pub fn router() -> Router {
     Router::new()
-        .route("/api/v1/feed/graphql", post(post_graphql).get(get_graphql))
+        .route(
+            "/api/graphql/_difflog/{org}/{db}",
+            post(post_scoped).get(get_scoped),
+        )
         .route("/api/v1/feed/status", get(status))
 }
 
@@ -90,11 +107,13 @@ struct Pending {
     authorizer: Arc<Authorizer>,
     user: String,
     password: String,
+    /// The database the path named, if any.
+    scope: Option<(String, String)>,
 }
 
 /// Parse the request's credential and pick up the attached state. Does not
 /// verify anything, and deliberately reads nothing from the store.
-fn pending(headers: &HeaderMap) -> Result<Pending, Response> {
+fn pending(headers: &HeaderMap, scope: Option<(String, String)>) -> Result<Pending, Response> {
     let FeedState::Attached(feed, authorizer) = feed_handle() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -117,6 +136,7 @@ fn pending(headers: &HeaderMap) -> Result<Pending, Response> {
         authorizer,
         user,
         password,
+        scope,
     })
 }
 
@@ -135,6 +155,7 @@ async fn execute(request: GraphQLRequest, pending: Pending) -> Response {
             feed: pending.feed,
             authorizer: pending.authorizer,
             identity,
+            scope: pending.scope,
         };
         let schema = schema();
         let response = request.execute_sync(&schema, &context);
@@ -176,8 +197,28 @@ enum Outcome {
     Failed(String),
 }
 
-async fn post_graphql(headers: HeaderMap, body: Bytes) -> Response {
-    let pending = match pending(&headers) {
+async fn post_scoped(
+    AxumPath((org, db)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    post_graphql(headers, Some((org, db)), body).await
+}
+
+async fn get_scoped(
+    AxumPath((org, db)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+    params: AxumQuery<GetParams>,
+) -> Response {
+    get_graphql(headers, Some((org, db)), params).await
+}
+
+async fn post_graphql(
+    headers: HeaderMap,
+    scope: Option<(String, String)>,
+    body: Bytes,
+) -> Response {
+    let pending = match pending(&headers, scope) {
         Ok(pending) => pending,
         Err(response) => return response,
     };
@@ -203,8 +244,12 @@ struct GetParams {
     operation_name: Option<String>,
 }
 
-async fn get_graphql(headers: HeaderMap, AxumQuery(params): AxumQuery<GetParams>) -> Response {
-    let pending = match pending(&headers) {
+async fn get_graphql(
+    headers: HeaderMap,
+    scope: Option<(String, String)>,
+    AxumQuery(params): AxumQuery<GetParams>,
+) -> Response {
+    let pending = match pending(&headers, scope) {
         Ok(pending) => pending,
         Err(response) => return response,
     };
@@ -226,7 +271,7 @@ async fn get_graphql(headers: HeaderMap, AxumQuery(params): AxumQuery<GetParams>
 }
 
 async fn status(headers: HeaderMap) -> Response {
-    let pending = match pending(&headers) {
+    let pending = match pending(&headers, None) {
         Ok(pending) => pending,
         Err(response) => return response,
     };
