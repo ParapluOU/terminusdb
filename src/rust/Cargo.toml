@@ -27,7 +27,7 @@ tdb-succinct = {git="https://github.com/terminusdb-org/tdb-succinct", tag="v0.2.
 # character-identical to woql-proof's own (same URL, same branch) for cargo to
 # treat them as one source. Local store edits therefore have to be pushed to
 # that branch before this server picks them up.
-terminus-store = {git="https://github.com/ParapluOU/terminusdb-store", branch="parture-proof-of-woql"}
+terminus-store = {git="https://github.com/ParapluOU/terminusdb-store", branch="main"}
 swipl = {git="https://github.com/terminusdb-org/swipl-rs"}
 #swipl = {path="../../../swipl-rs/swipl"}
 
@@ -39,7 +39,7 @@ swipl = {git="https://github.com/terminusdb-org/swipl-rs"}
 # store this server actually uses. The fork's version tracks the upstream
 # release (0.23.1), which is what makes it an acceptable replacement here.
 [patch."https://github.com/terminusdb-org/terminusdb-store"]
-terminus-store = {git="https://github.com/ParapluOU/terminusdb-store", branch="parture-proof-of-woql"}
+terminus-store = {git="https://github.com/ParapluOU/terminusdb-store", branch="main"}
 
 #[patch."https://github.com/terminusdb-org/tdb-succinct"]
 #tdb-succinct = {path="../../../tdb-succinct"}

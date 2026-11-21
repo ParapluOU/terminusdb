@@ -18,9 +18,9 @@ terminus-store = { version = "0.23.1", features = [] }
 # cannot resolve it at all. A workspace holding both checked out patches these
 # back to the local copies, so in-tree edits still apply without a push — see
 # terminusdb-rs's root manifest.
-terminusdb-woql2 = { git = "https://github.com/ParapluOU/terminusdb-rs.git", rev = "98e9858bf939cc26ded907c0d088200d5e51b784" }
-terminusdb-woql-proof = { git = "https://github.com/ParapluOU/terminusdb-rs.git", rev = "98e9858bf939cc26ded907c0d088200d5e51b784" }
-terminusdb-schema = { git = "https://github.com/ParapluOU/terminusdb-rs.git", rev = "98e9858bf939cc26ded907c0d088200d5e51b784" }
+terminusdb-woql2 = { git = "https://github.com/ParapluOU/terminusdb-rs.git", rev = "b28bc47f29832d7a9642bd9bd6864cb9ec93a3ab" }
+terminusdb-woql-proof = { git = "https://github.com/ParapluOU/terminusdb-rs.git", rev = "b28bc47f29832d7a9642bd9bd6864cb9ec93a3ab" }
+terminusdb-schema = { git = "https://github.com/ParapluOU/terminusdb-rs.git", rev = "b28bc47f29832d7a9642bd9bd6864cb9ec93a3ab" }
 serde_json = "1.0"
 thiserror = "2"
 
