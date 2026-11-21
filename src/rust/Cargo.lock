@@ -6389,7 +6389,7 @@ dependencies = [
 [[package]]
 name = "terminus-store"
 version = "0.23.1"
-source = "git+https://github.com/terminusdb-org/terminusdb-store?tag=v0.23.1#d08c3c14cf57b29893698f295460793b09113ebc"
+source = "git+https://github.com/ParapluOU/terminusdb-store?branch=parture-proof-of-woql#e26e7c8573f8fc84981ae0e8b5ab9c5beca0b5fb"
 dependencies = [
  "async-trait",
  "atomicwrites",
@@ -6405,6 +6405,7 @@ dependencies = [
  "hex",
  "itertools 0.10.5",
  "lazy_static",
+ "libc",
  "lru 0.10.1",
  "num-derive",
  "num-traits",

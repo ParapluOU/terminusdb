@@ -11,8 +11,24 @@ debug = 1
 
 [patch.crates-io]
 tdb-succinct = {git="https://github.com/terminusdb-org/tdb-succinct", tag="v0.2.1"}
-terminus-store = {git="https://github.com/terminusdb-org/terminusdb-store", tag="v0.23.1"}
+# One store lineage for the whole server. The fork is version 0.23.1 on purpose
+# so this patch is semver-accepted, and it is a superset of upstream v0.23.1:
+# the proving stack is behind its own opt-in `proof` feature, which nothing here
+# asks for, so the server compiles no curve arithmetic and its layers are
+# byte-identical to an unforked store's.
+terminus-store = {git="https://github.com/ParapluOU/terminusdb-store", branch="parture-proof-of-woql"}
 swipl = {git="https://github.com/terminusdb-org/swipl-rs"}
+
+# The other route to the store, and the one that matters: both
+# terminusdb-store-prolog and terminusdb-grpc-labelstore-client declare
+# terminus-store by git URL at terminusdb-org. Redirecting the SOURCE catches
+# both — including the grpc client, whose manifest is in a repository we do not
+# control. Editing store-prolog's declaration alone leaves the grpc client on
+# its own copy, and `GrpcLabelStore` then implements that copy's `LabelStore`
+# and stops satisfying ours: a trait-bound error that reads like a code bug
+# rather than the resolution bug it is.
+[patch."https://github.com/terminusdb-org/terminusdb-store"]
+terminus-store = {git="https://github.com/ParapluOU/terminusdb-store", branch="parture-proof-of-woql"}
 #swipl = {path="../../../swipl-rs/swipl"}
 
 #[patch."https://github.com/terminusdb-org/tdb-succinct"]
