@@ -35,6 +35,8 @@ info(_System_DB, Auth, Info) :-
     number_string(Storage_Version, Storage_Version_String),
     server_edition(Edition),
     http_engine(Http_Engine),
+    distribution(Distribution),
+    server_extensions(Extensions),
 
     indexer_info(Indexer_Info),
     (   is_anonymous_authority(Auth)
@@ -42,6 +44,8 @@ info(_System_DB, Auth, Info) :-
                authority: Auth,
                edition: Edition,
                http_engine: Http_Engine,
+               distribution: Distribution,
+               extensions: Extensions,
                indexer: Indexer_Info,
                storage:
                _{
@@ -52,6 +56,8 @@ info(_System_DB, Auth, Info) :-
                authority: Auth,
                edition: Edition,
                http_engine: Http_Engine,
+               distribution: Distribution,
+               extensions: Extensions,
                indexer: Indexer_Info,
                terminusdb :
                _{
@@ -68,6 +74,40 @@ info(_System_DB, Auth, Info) :-
                }
            }
     ).
+
+%% distribution(-Distribution) is det.
+%
+%  Which build of TerminusDB this is. `paraplu` for this fork, which carries
+%  surfaces upstream does not: see server_extensions/1 for the list.
+%
+%  A client should branch on the EXTENSIONS rather than on this. The
+%  distribution says who built the server, not what it can do, and an older
+%  paraplu build answers `paraplu` while lacking the newest surfaces — so
+%  mapping a distribution name to a feature set means maintaining a version
+%  table that silently goes stale. This is here for diagnostics and for support
+%  questions ("what are you running?"), not as a capability check.
+distribution(paraplu).
+
+%% server_extensions(-Extensions) is det.
+%
+%  The non-upstream surfaces this build actually carries, as a list of atoms.
+%
+%  Derived from what is registered rather than declared from a literal: each
+%  extension is detected through a predicate its own loader installs, so the
+%  answer cannot drift from reality the way a hand-maintained list would. A
+%  dylib that failed to register, or a build with a module compiled out,
+%  reports the truth instead of a promise.
+%
+%    difflog       - the pollable per-commit diff log at
+%                    /api/graphql/_difflog/<org>/<db>
+%    commit_hooks  - after-commit fan-out for derived structures
+server_extensions(Extensions) :-
+    findall(Extension, server_extension(Extension), Extensions).
+
+server_extension(difflog) :-
+    current_predicate('$difflog':difflog_attach_store/1).
+server_extension(commit_hooks) :-
+    current_predicate('$appserver':appserver_publish_commit/7).
 
 %% server_edition(-Edition) is det.
 %
@@ -146,6 +186,27 @@ is_anonymous_authority('terminusdb://system/data/User/anonymous') :- !.
 is_anonymous_authority(doc:anonymous) :- !.
 
 :- begin_tests(api_info, []).
+
+test(distribution_names_this_fork, []) :-
+    distribution(paraplu).
+
+test(extensions_are_detected_not_declared, []) :-
+    % The list comes from registered predicates, so in a build where the dylib
+    % loaded both surfaces are present; in one where it did not, neither is.
+    % Either way the answer matches reality rather than a literal someone
+    % forgot to update.
+    server_extensions(Extensions),
+    is_list(Extensions),
+    forall(member(Extension, Extensions),
+           memberchk(Extension, [difflog, commit_hooks])),
+    (   current_predicate('$difflog':difflog_attach_store/1)
+    ->  memberchk(difflog, Extensions)
+    ;   \+ memberchk(difflog, Extensions)
+    ),
+    (   current_predicate('$appserver':appserver_publish_commit/7)
+    ->  memberchk(commit_hooks, Extensions)
+    ;   \+ memberchk(commit_hooks, Extensions)
+    ).
 :- use_module(core(util/test_utils)).
 :- use_module(core(triple/constants), [super_user_authority/1]).
 :- use_module(config(terminus_config), [set_memory_mode/0,
