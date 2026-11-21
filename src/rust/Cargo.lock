@@ -7625,6 +7625,7 @@ dependencies = [
 [[package]]
 name = "terminusdb-format"
 version = "0.2.0"
+source = "git+https://github.com/ParapluOU/terminusdb-rs.git?rev=98e9858bf939cc26ded907c0d088200d5e51b784#98e9858bf939cc26ded907c0d088200d5e51b784"
 dependencies = [
  "serde",
  "serde_json",
@@ -7671,6 +7672,7 @@ dependencies = [
 [[package]]
 name = "terminusdb-schema"
 version = "0.2.0"
+source = "git+https://github.com/ParapluOU/terminusdb-rs.git?rev=98e9858bf939cc26ded907c0d088200d5e51b784#98e9858bf939cc26ded907c0d088200d5e51b784"
 dependencies = [
  "anyhow",
  "bigdecimal",
@@ -7704,6 +7706,7 @@ dependencies = [
 [[package]]
 name = "terminusdb-schema-derive"
 version = "0.2.0"
+source = "git+https://github.com/ParapluOU/terminusdb-rs.git?rev=98e9858bf939cc26ded907c0d088200d5e51b784#98e9858bf939cc26ded907c0d088200d5e51b784"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7796,6 +7799,7 @@ dependencies = [
 [[package]]
 name = "terminusdb-woql-proof"
 version = "0.1.0"
+source = "git+https://github.com/ParapluOU/terminusdb-rs.git?rev=98e9858bf939cc26ded907c0d088200d5e51b784#98e9858bf939cc26ded907c0d088200d5e51b784"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7822,6 +7826,7 @@ dependencies = [
 [[package]]
 name = "terminusdb-woql2"
 version = "0.2.0"
+source = "git+https://github.com/ParapluOU/terminusdb-rs.git?rev=98e9858bf939cc26ded907c0d088200d5e51b784#98e9858bf939cc26ded907c0d088200d5e51b784"
 dependencies = [
  "anyhow",
  "chrono",
@@ -8452,6 +8457,7 @@ checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
 [[package]]
 name = "typestate"
 version = "0.2.0"
+source = "git+https://github.com/ParapluOU/terminusdb-rs.git?rev=98e9858bf939cc26ded907c0d088200d5e51b784#98e9858bf939cc26ded907c0d088200d5e51b784"
 
 [[package]]
 name = "ubyte"
