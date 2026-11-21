@@ -550,6 +550,18 @@ fn an_unknown_database_or_branch_is_an_error_not_an_empty_log() {
 }
 
 #[test]
+fn warming_reports_whether_the_commit_it_was_told_about_is_visible() {
+    // A commit hook fires from inside the transaction that produced it, so the
+    // branch head can still be invisible. Warming must say so rather than let
+    // a watermark advance past a commit the index does not contain.
+    let (store, _) = database(3);
+    let feed = Feed::new(store, 8, 8);
+    assert!(feed.warm_through(&key(), "c2").unwrap());
+    assert!(!feed.warm_through(&key(), "c3").unwrap());
+    assert_eq!(3, feed.warm(&key()).unwrap());
+}
+
+#[test]
 fn branches_are_discoverable() {
     let (store, _) = database(1);
     let feed = Feed::new(store, 8, 8);

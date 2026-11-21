@@ -377,7 +377,9 @@ commit_validation_object(Validation_Object, [Parent_Transaction]) :-
                                            _Commit_Uri)
         ),
         register_commit_in_change_window(Descriptor, ParentCommitId, Commit_Id,
-                                         Instance_Object, Schema_Object)
+                                         Instance_Object, Schema_Object),
+        publish_commit_to_hooks(Descriptor, ParentCommitId, Commit_Id,
+                                Instance_Object, Schema_Object)
     ;   true).
 
 insert_rwo_layer(Transaction, RWO, Layer_Uri) :-
@@ -430,6 +432,64 @@ register_commit_in_change_window(Descriptor, ParentCommitId, CommitId, Instance_
                                      InstanceAdded, InstanceRemoved).
 register_commit_in_change_window(Descriptor, _ParentCommitId, _CommitId, _Instance_Object, _Schema_Object) :-
     throw(error(unknown_validation_descriptor_for_branch_key(Descriptor), _)).
+
+%% publish_commit_to_hooks(+Descriptor, +ParentCommitId, +CommitId, +Instance_Object, +Schema_Object) is det.
+%
+%  Announce the commit to the Rust derived-structure hooks (the diff log's
+%  offset index today; the proof sidecar and the change window are the obvious
+%  next consumers).
+%
+%  This passes only what this clause already holds and computes nothing, so it
+%  cannot lengthen the transaction. It also cannot fail it: every hook's
+%  structure is derivable from the store on demand, so a dropped event costs a
+%  later reader one rebuild and nothing else. Any error here is swallowed for
+%  the same reason — a warm-up must never be able to fail a commit.
+publish_commit_to_hooks(_Descriptor, _ParentCommitId, none, _Instance_Object, _Schema_Object) :-
+    !.
+publish_commit_to_hooks(Descriptor, ParentCommitId, CommitId, Instance_Object, Schema_Object) :-
+    catch(
+        publish_commit_to_hooks_(Descriptor, ParentCommitId, CommitId,
+                                 Instance_Object, Schema_Object),
+        Error,
+        json_log_error_formatted("commit hook publish raised ~w", [Error])
+    ),
+    !.
+publish_commit_to_hooks(Descriptor, _ParentCommitId, CommitId, _Instance_Object, _Schema_Object) :-
+    % Reached only when the clause above FAILED rather than threw — a
+    % descriptor shape this does not destructure, most likely. Logged rather
+    % than ignored: a silently dead hook is indistinguishable from a working
+    % one until something downstream is mysteriously cold.
+    json_log_error_formatted("commit hook publish did not apply to ~w (commit ~w)",
+                             [Descriptor, CommitId]).
+
+%% publish_commit_to_hooks_(+Descriptor, +ParentCommitId, +CommitId, +Instance_Object, +Schema_Object) is semidet.
+%
+%  Destructured with get_dict/3 one level at a time, NOT with a nested dict
+%  pattern: `Pattern :< Dict` unifies the *values* of the keys it names, and
+%  dict unification demands an identical key set, so a nested
+%  `repository_descriptor{database_descriptor: ...}` pattern silently fails
+%  against a real descriptor (which also carries `repository_name`).
+publish_commit_to_hooks_(Descriptor, ParentCommitId, CommitId, Instance_Object, Schema_Object) :-
+    get_dict(branch_name, Descriptor, Branch_Name),
+    get_dict(repository_descriptor, Descriptor, Repository_Descriptor),
+    get_dict(database_descriptor, Repository_Descriptor, Database_Descriptor),
+    get_dict(organization_name, Database_Descriptor, Organization),
+    get_dict(database_name, Database_Descriptor, Database),
+    (   ParentCommitId = none
+    ->  ParentArg = none
+    ;   ParentArg = ParentCommitId
+    ),
+    (   var(Instance_Object.read)
+    ->  InstanceLayerId = none
+    ;   layer_to_id(Instance_Object.read, InstanceLayerId)
+    ),
+    (   var(Schema_Object.read)
+    ->  SchemaLayerId = none
+    ;   layer_to_id(Schema_Object.read, SchemaLayerId)
+    ),
+    '$appserver':appserver_publish_commit(Organization, Database, Branch_Name,
+                                          CommitId, ParentArg,
+                                          InstanceLayerId, SchemaLayerId).
 
 commit_commit_validation_object(Commit_Validation_Object, [Parent_Transaction], New_Commit_Id, New_Commit_Uri) :-
     validation_object{

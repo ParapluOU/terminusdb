@@ -17,7 +17,13 @@ start_server(Port) :-
     appserver_hooks:normalize_static_paths,
     root_redirect_target(RedirectTarget),
     attach_difflog_feed,
-    '$appserver':appserver_start(Port, RedirectTarget).
+    '$appserver':appserver_start(Port, RedirectTarget),
+    % The hook worker drains derived-structure work published by commits. It
+    % starts after the listener so a consumer registered during dylib load is
+    % already in the registry; nothing is lost if it never starts, since every
+    % consumer can derive its structure on demand.
+    catch('$appserver':appserver_start_commit_hooks, Hook_Error,
+          json_log_error_formatted("commit hooks not started: ~w", [Hook_Error])).
 
 %% attach_difflog_feed is det.
 %

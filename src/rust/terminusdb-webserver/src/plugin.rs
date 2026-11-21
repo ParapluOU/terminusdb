@@ -533,6 +533,63 @@ predicates! {
         Ok(())
     }
 
+    #[module("$appserver")]
+    /// Announce a commit to the derived-structure hooks.
+    ///
+    /// Signature: `appserver_publish_commit(+Organization, +Database, +Branch,
+    /// +CommitId, +ParentCommitId, +InstanceLayerId, +SchemaLayerId)`, where
+    /// the last three may be the atom `none`.
+    ///
+    /// Returns immediately and always succeeds: the caller is a transaction,
+    /// and no derived structure may lengthen it or fail it. Everything a hook
+    /// does happens on a worker thread afterwards. See
+    /// `crate::commit_hooks` for why losing an event is safe.
+    pub semidet fn appserver_publish_commit(
+        _context,
+        organization_term,
+        database_term,
+        branch_term,
+        commit_id_term,
+        parent_commit_id_term,
+        instance_layer_term,
+        schema_layer_term,
+    ) {
+        fn optional(term: &swipl::prelude::Term) -> Option<String> {
+            let value: Option<String> = term.get::<String>().ok().or_else(|| {
+                term.get::<Atom>().ok().map(|atom| atom.name().to_string())
+            });
+            match value {
+                Some(value) if value != "none" && !value.is_empty() => Some(value),
+                _ => None,
+            }
+        }
+        fn required(term: &swipl::prelude::Term) -> String {
+            optional(term).unwrap_or_default()
+        }
+
+        let event = crate::commit_hooks::CommitEvent {
+            organization: required(&organization_term),
+            database: required(&database_term),
+            branch: required(&branch_term),
+            commit_id: required(&commit_id_term),
+            parent_commit_id: optional(&parent_commit_id_term),
+            instance_layer: optional(&instance_layer_term),
+            schema_layer: optional(&schema_layer_term),
+        };
+        if !event.commit_id.is_empty() && !event.database.is_empty() {
+            crate::commit_hooks::publish(event);
+        }
+        Ok(())
+    }
+
+    #[module("$appserver")]
+    /// Start the derived-structure hook worker. Idempotent.
+    pub semidet fn appserver_start_commit_hooks(_context) {
+        crate::commit_hooks::start();
+        Ok(())
+    }
+
+    #[module("$appserver")]
     /// Publish the server readiness flag reported by /api/v1/health.
     ///
     /// Signature: `appserver_set_ready(+Ready)` where Ready is `true` or
@@ -540,7 +597,6 @@ predicates! {
     /// `true` once startup has completed, so the health endpoint answers
     /// 503 {"status":"starting"} during initialization and 200
     /// {"status":"ready"} afterwards.
-    #[module("$appserver")]
     pub semidet fn appserver_set_ready(_context, ready_term) {
         let ready: bool = ready_term.get_ex()?;
         crate::server::set_ready(ready);
@@ -550,6 +606,8 @@ predicates! {
 
 pub fn register() {
     register_appserver_start();
+    register_appserver_publish_commit();
+    register_appserver_start_commit_hooks();
     register_appserver_shutdown();
     register_appserver_stream_send();
     register_appserver_stream_send_raw();
