@@ -5498,6 +5498,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pbkdf2"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
+dependencies = [
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "pear"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5994,7 +6003,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.3",
  "rustls 0.23.46",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -6032,7 +6041,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -7516,7 +7525,7 @@ dependencies = [
 [[package]]
 name = "terminus-store"
 version = "0.23.1"
-source = "git+https://github.com/ParapluOU/terminusdb-store?branch=parture-proof-of-woql#5b4f82d19371d2d120f2b6aea394a91c7d3bd9cc"
+source = "git+https://github.com/ParapluOU/terminusdb-store?branch=parture-proof-of-woql#e26e7c8573f8fc84981ae0e8b5ab9c5beca0b5fb"
 dependencies = [
  "ark-bn254",
  "ark-ec",
@@ -7562,12 +7571,14 @@ name = "terminusdb-community"
 version = "0.1.0"
 dependencies = [
  "aho-corasick 0.7.20",
+ "axum 0.8.9",
  "base64 0.22.1",
  "bimap",
  "chrono",
  "float-ord",
  "gmp-mpfr-sys",
  "handlebars",
+ "hmac",
  "itertools 0.10.5",
  "jsonwebtoken",
  "juniper",
@@ -7577,6 +7588,7 @@ dependencies = [
  "lru 0.16.3",
  "nom 7.1.3",
  "ordered-float 3.9.2",
+ "pbkdf2",
  "rand 0.9.5",
  "rayon",
  "regex",
@@ -7612,7 +7624,7 @@ dependencies = [
 
 [[package]]
 name = "terminusdb-format"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7658,7 +7670,7 @@ dependencies = [
 
 [[package]]
 name = "terminusdb-schema"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bigdecimal",
@@ -7691,7 +7703,7 @@ dependencies = [
 
 [[package]]
 name = "terminusdb-schema-derive"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7809,7 +7821,7 @@ dependencies = [
 
 [[package]]
 name = "terminusdb-woql2"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -8439,7 +8451,7 @@ checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
 
 [[package]]
 name = "typestate"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "ubyte"
