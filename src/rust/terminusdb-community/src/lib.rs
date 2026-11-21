@@ -8,6 +8,7 @@ mod change_window;
 pub mod changes;
 mod clock;
 pub mod consts;
+pub mod difflog;
 mod doc;
 mod embedding;
 mod expanded_name;
@@ -247,6 +248,7 @@ pub fn install() {
     changes::register();
     clock::register();
     change_window::register();
+    difflog::register();
     embedding::register();
     inference::register();
     jwt::register();

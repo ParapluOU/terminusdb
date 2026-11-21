@@ -16,6 +16,15 @@ lcs = "0.2.0"
 swipl = {version="0.3.16", features=["serde"]}
 terminusdb-store-prolog = {path="../terminusdb-store-prolog"}
 terminusdb-webserver = {path="../terminusdb-webserver"}
+# The diff-log feed serves native routes through the webserver's router, so it
+# needs the same axum and tokio the webserver binds its listener with.
+axum = "0.8.1"
+# Verifying a TerminusDB user's password where the request is served: the
+# system graph stores `$pbkdf2-sha512$t=<iters>$<salt>$<hash>`, so the feed
+# checks the same credential the rest of the API checks instead of inventing
+# its own.
+pbkdf2 = { version = "0.12", default-features = false }
+hmac = "0.12"
 itertools = "0.10.3"
 serde_json = {version="1", features=["preserve_order", "arbitrary_precision"]}
 lazy_static = "1.4"
@@ -48,7 +57,9 @@ url = "2.5.4"
 gmp-mpfr-sys = { version = "~1.7", default-features = false, optional = true }
 jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tokio = { version = "1", features = ["rt", "time"] }
+# `rt-multi-thread` + `sync`: the diff-log feed runs its blocking store
+# reads on the webserver runtime's blocking pool.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync"] }
 base64 = "0.22"
 
 [target.'cfg(target_os = "macos")'.dependencies]
