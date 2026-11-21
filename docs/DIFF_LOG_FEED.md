@@ -45,23 +45,43 @@ the whole log is always derivable from the store.
 
 ## Using it
 
-No configuration, and no feed-specific secret: it takes the same credential as
-the rest of the API. Follow a branch — the cheap mode gives offsets, commit
-metadata and counts:
+No configuration and no feed-specific secret: same credential as the rest of
+the API, and the same URL shape. The log of a database is another view in the
+GraphQL family, beside `_commits` and `_meta`:
 
 ```bash
-curl -s -u admin:root localhost:6363/api/v1/feed/graphql \
+curl -s -u admin:root \
+  localhost:6363/api/graphql/_difflog/admin/people \
   -H 'Content-Type: application/json' \
-  -d '{"query":"{ feed(database:\"admin/people\", from:0, limit:10) {
+  -d '{"query":"{ feed(from:0, limit:10) {
          epoch head lag nextOffset
          records { offset commit addedCount removedCount message } } }"}'
 ```
+
+The database comes from the path, so `database:` is optional; supplying one
+that disagrees with the path is an error rather than silently preferring
+either.
+
+The selector leads here (`_difflog/<org>/<db>`) where `_commits` trails
+(`<org>/<db>/local/_commits`), and that asymmetry is forced rather than
+chosen: the Prolog subscription plugin owns `/api/graphql/{*path}`, all routes
+share one router, and the router refuses a catch-all beside a parameter route
+at the same position — it panics at startup rather than falling through, so
+the suffix form stops the server from binding at all.
+
+Related: the existing commit-graph endpoint
+(`/api/graphql/<org>/<db>/local/_commits`) already *declares*
+`instance_added`, `instance_updated` and `instance_removed` on every commit —
+they are queryable today and always empty, because nothing populates them.
+Those are document IRIs rather than triples, which is the granularity a
+document-level cache wants; filling them is a separate piece of work from this
+feed, and the commit hook is where it would go.
 
 Ask for payloads where you care:
 
 ```graphql
 {
-  feed(database: "admin/people", from: 7, limit: 1, triples: true) {
+  feed(from: 7, limit: 1, triples: true) {
     records {
       offset commit
       added   { subject predicate object node }
@@ -82,7 +102,9 @@ survived.
 `{ databases }` and `{ branches(database: "admin/people") }` are there for
 discovery; `GET /api/v1/feed/status` reports what is indexed.
 
-Both `POST` and `GET /api/v1/feed/graphql?query=…` work.
+Both `POST` and `GET ...?query=…` work. `GET /api/v1/feed/status` is the
+operational view — attached store, index occupancy, hook counters — and is
+deliberately not part of the data surface.
 
 ## Authorization
 

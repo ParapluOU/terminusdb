@@ -29,10 +29,41 @@ pub struct FeedContext {
     pub feed: Arc<Feed>,
     pub authorizer: Arc<Authorizer>,
     pub identity: Identity,
+    /// The database the request's path named, when it named one.
+    ///
+    /// Served at `/api/graphql/<org>/<db>/local/_difflog`, the database is
+    /// already in the URL — as it is for `_commits` and `_meta` — so the
+    /// `database` argument becomes redundant and is optional. A query that
+    /// supplies one anyway must agree with the path: silently preferring
+    /// either would make the same query mean different things at different
+    /// URLs.
+    pub scope: Option<(String, String)>,
 }
 impl juniper::Context for FeedContext {}
 
 impl FeedContext {
+    /// Which database a field is about: the argument if given, else the path.
+    fn database(&self, argument: Option<&str>) -> FieldResult<(String, String)> {
+        match (argument, self.scope.as_ref()) {
+            (Some(argument), Some(scope)) => {
+                let named = split_database(argument)?;
+                if &named != scope {
+                    return Err(format!(
+                        "this endpoint serves {}/{}, but the query asked for {argument}",
+                        scope.0, scope.1
+                    )
+                    .into());
+                }
+                Ok(named)
+            }
+            (Some(argument), None) => split_database(argument),
+            (None, Some(scope)) => Ok(scope.clone()),
+            (None, None) => Err("no database: supply `database: \"<org>/<db>\"`, or use \
+                                 /api/graphql/<org>/<db>/local/_difflog"
+                .into()),
+        }
+    }
+
     /// Every field that names a database goes through here first. Keeping the
     /// check at the field rather than at the route is what lets `databases`
     /// filter instead of refuse, and makes it impossible to add a field that
@@ -114,12 +145,13 @@ impl FeedRoot {
             .collect())
     }
 
-    /// Branches of a database, each of which is its own log.
+    /// Branches of a database, each of which is its own log. Defaults to the
+    /// database in the path.
     fn branches(
         #[graphql(context)] context: &FeedContext,
-        database: String,
+        database: Option<String>,
     ) -> FieldResult<Vec<String>> {
-        let (org, db) = split_database(&database)?;
+        let (org, db) = context.database(database.as_deref())?;
         context.authorize(&org, &db)?;
         Ok(context.feed.branches(&org, &db)?)
     }
@@ -130,7 +162,11 @@ impl FeedRoot {
     /// parameter: this juniper version parses them only there, and a default
     /// it does not see silently becomes a required non-null argument.
     #[graphql(arguments(
-        database(description = "`organization/database`."),
+        database(
+            description = "`organization/database`. Optional when the endpoint already \
+                           names one, as /api/graphql/<org>/<db>/local/_difflog does; \
+                           supplying one that disagrees with the path is an error."
+        ),
         branch(
             default = "main".to_string(),
             description = "Which branch's log. Each branch is a separate sequence."
@@ -160,14 +196,14 @@ impl FeedRoot {
     ))]
     fn feed(
         #[graphql(context)] context: &FeedContext,
-        database: String,
+        database: Option<String>,
         branch: String,
         from: i32,
         limit: i32,
         after: Option<String>,
         triples: bool,
     ) -> FieldResult<FeedPage> {
-        let (org, db) = split_database(&database)?;
+        let (org, db) = context.database(database.as_deref())?;
         context.authorize(&org, &db)?;
         let key = BranchKey { org, db, branch };
         let limit = as_usize(limit).min(10_000);
