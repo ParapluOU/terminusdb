@@ -171,6 +171,7 @@ pretty_print_record(Offset,Record,Last_DB) :-
 
 :- begin_tests(db).
 :- use_module(core(util/test_utils)).
+:- use_module(library(memfile)).
 
 test(list_all,
      [setup((setup_temp_store(State),
@@ -299,5 +300,88 @@ test(expired_failed_mark_retries_open,
     resolve_absolute_string_descriptor("admin/realdb", Descriptor),
     open_descriptor(Descriptor, _Transaction),
     assertion(\+ descriptor:db_failed("admin", "realdb", _)).
+
+% A background database load that cannot log must still clear the
+% loading mark. The loader runs in a thread spawned with detached(true)
+% from the request whose open failed, and such a thread inherits that
+% request's output stream — which is erased the moment the request
+% completes. json_log then throws existence_error(stream, _) out of
+% is_cgi_stream/1 while taking the request id, and anything the loader
+% had left to do never runs. With the retractall of the loading mark
+% left outside a cleanup, every later request on that database waits
+% out the grace window and answers `database_loading` for good.
+%
+% run_with_erased_output/3 reproduces exactly that condition: the goal
+% runs in a thread that inherited an output stream its creator has since
+% closed. The queue makes the order deterministic — the thread does not
+% start until the stream is gone. The test store has to be handed over
+% explicitly because local_triple_store_var/1 is thread-local: a spawned
+% thread would otherwise see no store at all and every open would fail
+% for a reason that has nothing to do with what is under test.
+run_with_erased_output(Store, Goal, Status) :-
+    message_queue_create(Queue),
+    new_memory_file(Memory_File),
+    open_memory_file(Memory_File, write, Stream),
+    setup_call_cleanup(
+        set_output(Stream),
+        thread_create((thread_get_message(Queue, go),
+                       set_local_triple_store(Store),
+                       Goal),
+                      Thread, []),
+        set_output(user_error)),
+    close(Stream),
+    thread_send_message(Queue, go),
+    thread_join(Thread, Status),
+    message_queue_destroy(Queue),
+    free_memory_file(Memory_File).
+
+test(background_load_clears_mark_when_logging_fails,
+     [setup((setup_temp_store(State),
+             State = Store-_Dir,
+             create_db_without_schema("admin","realdb"),
+             setenv('TERMINUSDB_DB_LOAD_WAIT','0'))),
+      cleanup((unsetenv('TERMINUSDB_DB_LOAD_WAIT'),
+               ignore(retract(descriptor:db_failed(_,_,_))),
+               ignore(retract(descriptor:db_unservable_loading(_,_,_))),
+               teardown_temp_store(State)))]) :-
+    % The load succeeds, so the mark must go and the database must serve
+    % again — even though the loader's success log cannot reach its
+    % stream.
+    get_time(Now),
+    assertz(descriptor:db_unservable_loading("admin", "realdb", Now)),
+    run_with_erased_output(Store,
+                           descriptor:reload_database_graphs("admin", "realdb"),
+                           Status),
+    assertion(Status == true),
+    assertion(\+ descriptor:db_unservable_loading("admin", "realdb", _)),
+    assertion(\+ descriptor:db_failed("admin", "realdb", _)),
+    resolve_absolute_string_descriptor("admin/realdb", Descriptor),
+    open_descriptor(Descriptor, _Transaction).
+
+test(failed_background_load_records_failure_when_logging_fails,
+     [setup((setup_temp_store(State),
+             State = Store-_Dir)),
+      cleanup((ignore(retract(descriptor:db_failed(_,_,_))),
+               ignore(retract(descriptor:db_unservable_loading(_,_,_))),
+               teardown_temp_store(State)))]) :-
+    % The load fails, so db_failed/3 must be recorded and the mark
+    % cleared: requests then answer a 500-class error that expires,
+    % never a 503 that does not. The loader must also run to completion
+    % rather than dying on its own log — a thread that logging kills
+    % leaves whatever follows the log undone.
+    create_context(system_descriptor{}, System_Context),
+    with_transaction(System_Context,
+        system_entity:insert_db_object(System_Context, "admin", "ghostdb",
+                                       "ghost label", "ghost comment", Db_Uri),
+        _),
+    db_create:finalize_db(Db_Uri),
+    get_time(Now),
+    assertz(descriptor:db_unservable_loading("admin", "ghostdb", Now)),
+    run_with_erased_output(Store,
+                           descriptor:reload_database_graphs("admin", "ghostdb"),
+                           Status),
+    assertion(Status == true),
+    assertion(\+ descriptor:db_unservable_loading("admin", "ghostdb", _)),
+    assertion(descriptor:db_failed("admin", "ghostdb", _)).
 
 :- end_tests(db).
