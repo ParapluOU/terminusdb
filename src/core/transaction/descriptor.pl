@@ -855,15 +855,21 @@ db_load_wait(Seconds) :-
 %  store take whatever time it takes. Success clears the loading mark so
 %  the next request serves; failure records db_failed/3 so requests
 %  answer 500 until the mark expires and a retry is allowed.
+%  The mark is cleared in a cleanup, not after the body: this runs in a
+%  detached thread, and a detached thread that dies takes the rest of
+%  its goal with it silently. A loading mark left asserted is permanent
+%  — every later request on the database waits out the grace window and
+%  answers `database_loading` for as long as the process lives.
 reload_database_graphs(Organization_Name, Database_Name) :-
-    (   catch(open_user_database_graphs(Organization_Name, Database_Name,
-                                        [], _Map, _Schema, _Instance),
-              _Error, fail)
-    ->  json_log_info_formatted('database ~s/~s loaded; resuming service', [Organization_Name, Database_Name])
-    ;   get_time(Now),
-        assertz(db_failed(Organization_Name, Database_Name, Now)),
-        json_log_error_formatted('database ~s/~s could not be loaded; answering errors until the mark expires', [Organization_Name, Database_Name])),
-    retractall(db_unservable_loading(Organization_Name, Database_Name, _)).
+    call_cleanup(
+        (   catch(open_user_database_graphs(Organization_Name, Database_Name,
+                                            [], _Map, _Schema, _Instance),
+                  _Error, fail)
+        ->  json_log_info_formatted('database ~s/~s loaded; resuming service', [Organization_Name, Database_Name])
+        ;   get_time(Now),
+            assertz(db_failed(Organization_Name, Database_Name, Now)),
+            json_log_error_formatted('database ~s/~s could not be loaded; answering errors until the mark expires', [Organization_Name, Database_Name])),
+        retractall(db_unservable_loading(Organization_Name, Database_Name, _))).
 
 should_retain_layers_for_descriptor(system_descriptor{}) :-
     !.

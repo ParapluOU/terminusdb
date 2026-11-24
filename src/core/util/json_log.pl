@@ -160,15 +160,29 @@ generate_request_id_from_stream(CGI, Request_Id) :-
     !.
 generate_request_id_from_stream(_, _).
 
+%% current_output_cgi_stream(-Stream) is semidet.
+%
+%  The current output stream, when it is a CGI stream a request id can be
+%  read from. A thread inherits the output stream of the thread that
+%  created it, so a background worker spawned from a request holds that
+%  request's CGI stream — and that stream is erased as soon as the
+%  request completes, after which is_cgi_stream/1 throws
+%  existence_error(stream, _) rather than simply failing. An id is an
+%  adornment on a log entry; logging must never throw because it could
+%  not find one.
+current_output_cgi_stream(Stream) :-
+    catch(( current_output(Stream),
+            is_cgi_stream(Stream) ),
+          _Error,
+          fail).
+
 generate_operation_id(Operation_Id) :-
-    current_output(Stream),
-    (   is_cgi_stream(Stream)
+    (   current_output_cgi_stream(Stream)
     ->  generate_operation_id_from_stream(Stream, Operation_Id)
     ;   Operation_Id = _).
 
 generate_request_id(Request_Id) :-
-    current_output(Stream),
-    (   is_cgi_stream(Stream)
+    (   current_output_cgi_stream(Stream)
     ->  generate_request_id_from_stream(Stream, Request_Id)
     ;   Request_Id = _).
 
